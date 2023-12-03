@@ -1,4 +1,4 @@
-//ode_solver.rs
+// Filename: src/ode_solver.rs
 
 use super::neuron::NeuronState;
 
@@ -8,7 +8,7 @@ pub struct OdeSolver {
 }
 
 impl OdeSolver {
-    /// Initialize a new ODE solver.
+    /// Create a new ODE solver.
     pub fn new() -> Self {
         OdeSolver {
             // Initialization code here
@@ -16,14 +16,18 @@ impl OdeSolver {
     }
 
     /// Update the neuron state over a single time step using an ODE solver.
+    /// This implementation uses the simple Euler method.
     pub fn solve_step(&mut self, state: NeuronState, dt: f64, input: f64) -> NeuronState {
-        // Call the neuron's derivatives function to get the state derivative
-        let state_derivative = state.derivatives(0.0, input); // Time is hardcoded to 0.0 for demonstration
+        // Obtain the neuron's state derivatives
+        let state_derivative = state.derivatives(0.0, input);
 
-        // Simple Euler method for numerical ODE solving (replace with more accurate method)
+        // Update each state variable according to the Euler method.
+        // This assumes that all properties in NeuronState are included in the derivatives.
         NeuronState {
             membrane_potential: state.membrane_potential + state_derivative.membrane_potential * dt,
-            // Update other properties similarly
+            gating_variable: state.gating_variable + state_derivative.gating_variable * dt,
+            time_constant: state.time_constant + state_derivative.time_constant * dt,
+            // Add updates for any additional state variables here
         }
     }
 }
