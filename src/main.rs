@@ -14,6 +14,8 @@ mod input;
 mod lnn;
 mod network_components;
 mod output;
+mod neuron;
+mod ode_solver;
 
 // Define CLI arguments struct using Clap.
 #[derive(Parser)]
