@@ -6,12 +6,10 @@ use ndarray::Array2;
 use rand::{thread_rng, Rng};
 use serde::de::{self, Deserializer as _deDeserializer, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize};
 use serde::{Serialize, Serializer};
 use smartcore::{linalg::basic::matrix::DenseMatrix, linear::linear_regression::*};
 use std::fmt;
-
-
 
 /// Determines the size of the synaptic matrix based on given connections.
 /// Assumes `connections` is non-empty and that index tuples are 0-based.
@@ -29,7 +27,7 @@ fn determine_size_of_matrix_based_on_connections(
 const DEFAULT_DELAY: u32 = 1;
 
 impl<'de> Deserialize<'de> for SynapsesWrapper {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
     where
         D: _deDeserializer<'de>,
     {
@@ -56,7 +54,7 @@ impl<'de> Deserialize<'de> for SynapsesWrapper {
 
                 let size = determine_size_of_matrix_based_on_connections(&connections);
                 let mut synapses_array: Array2<Option<Synapse>> = Array2::default(size);
-                synapses_array.fill(None);
+
                 for elem in synapses_array.iter_mut() {
                     *elem = None; // This sets each element without requiring Clone
                 }
@@ -70,6 +68,7 @@ impl<'de> Deserialize<'de> for SynapsesWrapper {
         Err(de::Error::custom("Failed to deserialize synapses"))
     }
 }
+#[derive(Clone)]
 pub struct SynapsesWrapper(pub Array2<Option<Synapse>>);
 // Implement `Serialize` for `SynapsesWrapper` instead of for `Array2`
 impl Serialize for SynapsesWrapper {
@@ -84,7 +83,7 @@ impl Serialize for SynapsesWrapper {
         let synapse_data: Vec<((usize, usize), f64)> = self
             .0
             .indexed_iter()
-            .filter_map(|((row, col), &syn)| syn.as_ref().map(|s| ((row, col), s.weight)))
+            .filter_map(|((row, col), &ref syn)| syn.as_ref().map(|s| ((row, col), s.weight)))
             .collect();
 
         s.serialize_field("synapses", &synapse_data)?;
@@ -93,7 +92,7 @@ impl Serialize for SynapsesWrapper {
 }
 
 /// Represents the entire Liquid Neural Network.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LiquidNeuralNetwork {
     neurons: Vec<Neuron>,
     synapses: SynapsesWrapper,
@@ -111,7 +110,7 @@ impl LiquidNeuralNetwork {
             .collect();
 
         let mut synapses_array = Array::default((neuron_count, neuron_count));
-        for mut synapse_option in synapses_array.iter_mut() {
+        for synapse_option in synapses_array.iter_mut() {
             *synapse_option = None;
         }
         let synapses = SynapsesWrapper(synapses_array);
@@ -177,13 +176,27 @@ impl LiquidNeuralNetwork {
 
         // Convert readout_inputs to a DenseMatrix for Smartcore's Linear Regression fit
         let x = DenseMatrix::from_2d_vec(&readout_inputs);
-        let y = DenseMatrix::from_2d_vec(&vec![expected_outputs.clone()]);
+        let y = expected_outputs.to_vec();
 
-        let lr = LinearRegression::fit(&x, &y, Default::default())
-            .expect("Failed to fit Linear Regression model");
+        let _lr = LinearRegression::fit(
+            &x,
+            &y,
+            LinearRegressionParameters::default().with_solver(LinearRegressionSolverName::SVD), // or SVD
+        )
+        .expect("Failed to fit Linear Regression model");
+
+        /*
+        // To make predictions
+
+        let predictions = lr.predict(&x).expect("Failed to make predictions");
+
+        // Accessing coefficients
+        let coefficients = lr.coefficients();
+        let intercept = lr.intercept();
 
         // Store the learned weights
         self.readout_weights = lr.coefficients().to_vec();
+        */
     }
 
     /// Resets the network states, useful before processing each input during readout training.
@@ -196,18 +209,17 @@ impl LiquidNeuralNetwork {
     }
 
     pub fn run_simulation(&mut self, timesteps: usize, inputs: Vec<Vec<f64>>) {
-        assert_eq!(inputs.len(), self.input_indices.len(), "Input data must match the number of input neurons.");
+        let input_indices = self.input_indices.clone(); // Clone the input_indices
 
         for _ in 0..timesteps {
-            for (input_values, &idx) in inputs.iter().zip(self.input_indices.iter()) {
-                self.encode_input(input_values);
+            for (input_values, &_idx) in inputs.iter().zip(input_indices.iter()) {
+                self.encode_input(input_values); // Now `self` is not borrowed immutably here
             }
 
             // Update the state of each neuron here; may involve complex dynamics
             for neuron in &mut self.neurons {
-                neuron.update_state();
+                neuron.update_state(0.0);
             }
-
 
             // Propagate signals through the synapses
             // TODO: define additional logic to handle synaptic transmission and potential delay
@@ -216,7 +228,7 @@ impl LiquidNeuralNetwork {
             // }
 
             // Decode output here if needed, or store state for post-simulation analysis
-            let output = self.decode_output();
+            let _output = self.decode_output();
 
             // Placeholder: process the output as necessary, e.g., storing it, or using it in some way
             //

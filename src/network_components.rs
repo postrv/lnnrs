@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize, Serializer};
 
 /// Represents the state of a neuron within the LNN.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Neuron {
     pub potential: f64, // Membrane potential of the neuron
     pub recovery: f64,  // Recovery variable, used as an example here
@@ -50,7 +50,7 @@ impl Neuron {
 }
 
 /// Represents a directional synapse between two neurons within the LNN.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Synapse {
     pub weight: f64,
     pub delay: u32,

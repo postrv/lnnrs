@@ -11,7 +11,8 @@ pub fn read_input_from_csv(file_path: &str) -> Result<Vec<Vec<f64>>, Box<dyn Err
 
     for result in rdr.records() {
         let record = result?;
-        let input_values: Vec<f64> = record.iter()
+        let input_values: Vec<f64> = record
+            .iter()
             .map(|field| field.parse::<f64>().unwrap_or_default())
             .collect();
         inputs.push(input_values);

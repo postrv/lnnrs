@@ -4,20 +4,16 @@ use clap::Parser;
 use env_logger::Builder;
 use log::{info, LevelFilter};
 use ndarray::Array2;
-use ndarray_rand::rand_distr::num_traits::real::Real;
 use ndarray_rand::RandomExt; // Add this line to import RandomExt
 use rand_distr::Uniform;
-use rayon::prelude::*;
 use std;
 use std::error::Error;
 
 mod activation;
+mod input;
 mod lnn;
 mod network_components;
-mod input;
 mod output;
-
-
 
 // Define CLI arguments struct using Clap.
 #[derive(Parser)]
@@ -41,13 +37,12 @@ fn determine_neuron_count(inputs: &[Vec<f64>]) -> usize {
     }
 }
 
-
 fn main() -> Result<(), Box<dyn Error>> {
     // Initialize the logger
     Builder::new().filter(None, LevelFilter::Info).init();
 
     // Parse the command line arguments
-    let opts: Opts = Opts::parse();
+    let _opts: Opts = Opts::parse();
 
     // The main logic of application will go here.
     // For now, we'll just log an information message.
@@ -56,12 +51,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let inputs = input::read_input_from_csv("input_data.csv")?;
 
     let neuron_count = determine_neuron_count(&inputs); // implement this function
-    let mut lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
+    let lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
 
     // Here I will set up the neural network, start the simulation, etc.
 
     // Placeholder example of using ndarray, rand and rayon
-    let mut rng = rand::thread_rng();
+    let _rng = rand::thread_rng();
     let range = Uniform::new(-1.0, 1.0);
     let mut random_matrix: Array2<f64> = Array2::random((10, 10), range);
     let processed_matrix: () = random_matrix.par_mapv_inplace(|elem| (elem.sin()).powi(2)); // using rayon's parallel iterator here; // applying a non-linear transformation
