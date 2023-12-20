@@ -10,6 +10,8 @@ use serde::{Deserialize};
 use serde::{Serialize, Serializer};
 use smartcore::{linalg::basic::matrix::DenseMatrix, linear::linear_regression::*};
 use std::fmt;
+use nalgebra::DMatrix; // Ensure nalgebra crate is added to your Cargo.toml for eigenvalue computations.
+use nalgebra::ComplexField; // Traits for complex numbers.
 
 /// Determines the size of the synaptic matrix based on given connections.
 /// Assumes `connections` is non-empty and that index tuples are 0-based.
@@ -59,7 +61,7 @@ impl<'de> Deserialize<'de> for SynapsesWrapper {
                     *elem = None; // This sets each element without requiring Clone
                 }
                 for ((row, col), weight) in connections {
-                    synapses_array[[row, col]] = Some(Synapse::new(weight, DEFAULT_DELAY));
+                    synapses_array[[row, col]] = Some(Synapse::new(weight, DEFAULT_DELAY, 0, 0));
                 }
 
                 Ok(SynapsesWrapper(synapses_array))
@@ -123,6 +125,32 @@ impl LiquidNeuralNetwork {
             readout_weights: vec![],
         }
     }
+    /// Initializes the synapses with weights scaled to achieve a specified spectral radius.
+    pub fn initialize_synapses(&mut self, neuron_count: usize, spectral_radius: f64) {
+        let mut rng = thread_rng();
+        let mut raw_weights: Vec<f64> = (0..neuron_count * neuron_count)
+            .map(|_| rng.gen_range(-1.0..1.0)) // Random weights, adjust the range as necessary.
+            .collect();
+
+        // Convert the random weights into a matrix for eigenvalue computation.
+        let mut matrix = DMatrix::from_vec(neuron_count, neuron_count, raw_weights);
+
+        // Compute the eigenvalues of the matrix.
+        let eigenvalues = matrix.complex_eigenvalues();
+        let max_eigenvalue_magnitude = eigenvalues.iter().map(|ev| ev.modulus()).fold(0./0., f64::max);
+
+        // Scale the matrix by the desired spectral radius.
+        let scaling_factor = spectral_radius / max_eigenvalue_magnitude;
+        matrix *= scaling_factor;
+
+        // Create the synapses based on the scaled matrix.
+        let synapses_array: Array2<Option<Synapse>> = Array2::from_shape_fn(
+            (neuron_count, neuron_count),
+            |(i, j)| Some(Synapse::new(i as f64, j as u32, *matrix.index((i, j)) as usize, DEFAULT_DELAY as usize)),
+        );
+
+        self.synapses = SynapsesWrapper(synapses_array);
+    }
 
     /// Sets the indices of neurons that will act as the input interface.
     pub fn set_input_neurons(&mut self, indices: Vec<usize>) {
@@ -138,7 +166,7 @@ impl LiquidNeuralNetwork {
     pub fn connect_neurons(&mut self, pre_idx: usize, post_idx: usize, weight: f64, delay: u32) {
         // Check for valid indices and prevent self-connections
         if pre_idx != post_idx && pre_idx < self.neurons.len() && post_idx < self.neurons.len() {
-            self.synapses.0[[pre_idx, post_idx]] = Some(Synapse::new(weight, delay));
+            self.synapses.0[[pre_idx, post_idx]] = Some(Synapse::new(weight, delay, 0, 0));
         }
     }
 

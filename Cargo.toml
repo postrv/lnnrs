@@ -10,11 +10,12 @@ rand = "0.8.5"
 serde = { version = "1.0.193", features = ["derive"] }
 rand_distr = "0.4.3"
 ndarray = { version = "0.15.6", features = ["rayon"] }
-clap = {version = "4.4.8", features = ["derive"] }
+clap = {version = "4.4.11", features = ["derive"] }
 log = "0.4.20"
 env_logger = "0.10.1"
 smartcore = "0.3.2"
 rayon = "1.8.0"
+nalgebra = "0.32.3"
 
 [dev-dependencies]
 serde_json = "1.0.108"

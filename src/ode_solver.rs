@@ -1,6 +1,6 @@
 // Filename: src/ode_solver.rs
 
-use super::neuron::NeuronState;
+use super::network_components::NeuronState;
 
 /// The structure responsible for solving the neuron's ODEs over time.
 pub struct OdeSolver {
