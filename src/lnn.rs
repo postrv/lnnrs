@@ -1,17 +1,20 @@
 // lnn.rs
 
 use crate::network_components::{Neuron, Synapse};
+use nalgebra::ComplexField;
+use nalgebra::DMatrix; // Ensure nalgebra crate is added to your Cargo.toml for eigenvalue computations.
 use ndarray::Array;
 use ndarray::Array2;
 use rand::{thread_rng, Rng};
 use serde::de::{self, Deserializer as _deDeserializer, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
-use serde::{Deserialize};
+use serde::Deserialize;
 use serde::{Serialize, Serializer};
+use smartcore::linalg::traits::svd::SVDDecomposable;
 use smartcore::{linalg::basic::matrix::DenseMatrix, linear::linear_regression::*};
 use std::fmt;
-use nalgebra::DMatrix; // Ensure nalgebra crate is added to your Cargo.toml for eigenvalue computations.
-use nalgebra::ComplexField; // Traits for complex numbers.
+use std::ops::Index;
+use std::thread::current; // Traits for complex numbers.
 
 /// Determines the size of the synaptic matrix based on given connections.
 /// Assumes `connections` is non-empty and that index tuples are 0-based.
@@ -61,7 +64,12 @@ impl<'de> Deserialize<'de> for SynapsesWrapper {
                     *elem = None; // This sets each element without requiring Clone
                 }
                 for ((row, col), weight) in connections {
-                    synapses_array[[row, col]] = Some(Synapse::new(weight, DEFAULT_DELAY, 0, 0));
+                    synapses_array[[row, col]] = Some(Synapse::new(
+                        row,           // row is already usize
+                        col,           // col is already usize
+                        weight,        // weight is already f64
+                        DEFAULT_DELAY, // DEFAULT_DELAY is u32 and matches the expected type
+                    ));
                 }
 
                 Ok(SynapsesWrapper(synapses_array))
@@ -125,10 +133,31 @@ impl LiquidNeuralNetwork {
             readout_weights: vec![],
         }
     }
+
+    pub fn print_synapses(&self) {
+        for (i, row) in self.synapses.0.outer_iter().enumerate() {
+            for (j, synapse_option) in row.iter().enumerate() {
+                if let Some(synapse) = synapse_option {
+                    log::info!("Synapse from neuron {} to neuron {}: weight = {}, delay = {}",
+                           i, j, synapse.weight, synapse.delay);
+                }
+            }
+        }
+    }
+
+    /// Retrieves synapses connected to a specific neuron.
+    pub fn get_synapses_for_neuron(&self, neuron_idx: usize) -> Vec<Synapse> {
+        self.synapses.0
+            .index_axis(ndarray::Axis(0), neuron_idx)
+            .iter()
+            .filter_map(|synapse_opt| synapse_opt.as_ref().cloned())
+            .collect()
+    }
+
     /// Initializes the synapses with weights scaled to achieve a specified spectral radius.
     pub fn initialize_synapses(&mut self, neuron_count: usize, spectral_radius: f64) {
         let mut rng = thread_rng();
-        let mut raw_weights: Vec<f64> = (0..neuron_count * neuron_count)
+        let raw_weights: Vec<f64> = (0..neuron_count * neuron_count)
             .map(|_| rng.gen_range(-1.0..1.0)) // Random weights, adjust the range as necessary.
             .collect();
 
@@ -137,17 +166,25 @@ impl LiquidNeuralNetwork {
 
         // Compute the eigenvalues of the matrix.
         let eigenvalues = matrix.complex_eigenvalues();
-        let max_eigenvalue_magnitude = eigenvalues.iter().map(|ev| ev.modulus()).fold(0./0., f64::max);
+        let max_eigenvalue_magnitude = eigenvalues
+            .iter()
+            .map(|ev| ev.modulus())
+            .fold(0. / 0., f64::max);
 
         // Scale the matrix by the desired spectral radius.
         let scaling_factor = spectral_radius / max_eigenvalue_magnitude;
         matrix *= scaling_factor;
 
         // Create the synapses based on the scaled matrix.
-        let synapses_array: Array2<Option<Synapse>> = Array2::from_shape_fn(
-            (neuron_count, neuron_count),
-            |(i, j)| Some(Synapse::new(i as f64, j as u32, *matrix.index((i, j)) as usize, DEFAULT_DELAY as usize)),
-        );
+        let synapses_array: Array2<Option<Synapse>> =
+            Array2::from_shape_fn((neuron_count, neuron_count), |(i, j)| {
+                Some(Synapse::new(
+                    i,                     // i as usize
+                    j,                     // j as usize
+                    *matrix.index((i, j)), // matrix.index((i, j)) is already f64
+                    DEFAULT_DELAY,         // DEFAULT_DELAY is u32
+                ))
+            });
 
         self.synapses = SynapsesWrapper(synapses_array);
     }
@@ -166,7 +203,12 @@ impl LiquidNeuralNetwork {
     pub fn connect_neurons(&mut self, pre_idx: usize, post_idx: usize, weight: f64, delay: u32) {
         // Check for valid indices and prevent self-connections
         if pre_idx != post_idx && pre_idx < self.neurons.len() && post_idx < self.neurons.len() {
-            self.synapses.0[[pre_idx, post_idx]] = Some(Synapse::new(weight, delay, 0, 0));
+            self.synapses.0[[pre_idx, post_idx]] = Some(Synapse::new(
+                pre_idx,  // pre_idx is already usize
+                post_idx, // post_idx is already usize
+                weight,   // weight is already f64
+                delay,    // delay is u32 and matches the expected type
+            ));
         }
     }
 
@@ -174,18 +216,21 @@ impl LiquidNeuralNetwork {
     pub fn encode_input(&mut self, input_data: &[f64]) {
         for (&neuron_idx, &stimulus) in self.input_indices.iter().zip(input_data) {
             if let Some(neuron) = self.neurons.get_mut(neuron_idx) {
-                neuron.potential += stimulus; // Simple direct current stimulation
+                neuron.membrane_potential += stimulus; // Simple direct current stimulation
             }
         }
     }
 
     /// Decodes the output from the network into a meaningful signal.
     pub fn decode_output(&self) -> Vec<f64> {
-        self.output_indices
+        let output = self.output_indices
             .iter()
             .filter_map(|&idx| self.neurons.get(idx))
-            .map(|neuron| neuron.potential) // Read out the potentials as the output signal
-            .collect()
+            .map(|neuron| neuron.membrane_potential) // Read out the potentials as the output signal
+            .collect();
+
+        log::debug!("Decoded output: {:?}", output);
+        output
     }
 
     /// Trains a Linear Regression model as the readout layer for the LNN.
@@ -196,8 +241,7 @@ impl LiquidNeuralNetwork {
         for input in inputs.iter() {
             self.reset_state(); // Reset network state before input encoding
             self.encode_input(input); // Encode the current input pattern
-
-            // TODO: Simulate network dynamics and collect output response
+                                      // Run the simulation for a predefined number of timesteps
             let output_response = self.decode_output();
             readout_inputs.push(output_response);
         }
@@ -206,60 +250,122 @@ impl LiquidNeuralNetwork {
         let x = DenseMatrix::from_2d_vec(&readout_inputs);
         let y = expected_outputs.to_vec();
 
-        let _lr = LinearRegression::fit(
+        let lr = LinearRegression::fit(
             &x,
             &y,
             LinearRegressionParameters::default().with_solver(LinearRegressionSolverName::SVD), // or SVD
         )
         .expect("Failed to fit Linear Regression model");
 
-        /*
         // To make predictions
 
         let predictions = lr.predict(&x).expect("Failed to make predictions");
 
         // Accessing coefficients
         let coefficients = lr.coefficients();
+
         let intercept = lr.intercept();
 
-        // Store the learned weights
-        self.readout_weights = lr.coefficients().to_vec();
-        */
+        let intercept = lr.intercept();
+
+        // Store the learned weights as a vector
+        self.readout_weights = coefficients.svd().unwrap().s;
     }
 
     /// Resets the network states, useful before processing each input during readout training.
     pub fn reset_state(&mut self) {
         for neuron in &mut self.neurons {
-            neuron.potential = 0.0; // Reset the potential to the resting state
-                                    // Reset any other neuron states if necessary
+            // Reset all relevant neuron state variables
+            neuron.membrane_potential = 0.0;
+            neuron.gating_variable = 0.0; // Resetting gating variable if used
+            neuron.recovery = 0.0;        // Resetting recovery variable if used
+            // Add other state resets as necessary
         }
-        // Add synapses reset if required by the model
+        // Resetting synaptic states if required
+        // TODO: Implement if dynamic synapses are used
     }
 
-    pub fn run_simulation(&mut self, timesteps: usize, inputs: Vec<Vec<f64>>) {
-        let input_indices = self.input_indices.clone(); // Clone the input_indices
-
-        for _ in 0..timesteps {
-            for (input_values, &_idx) in inputs.iter().zip(input_indices.iter()) {
-                self.encode_input(input_values); // Now `self` is not borrowed immutably here
-            }
-
-            // Update the state of each neuron here; may involve complex dynamics
-            for neuron in &mut self.neurons {
-                neuron.update_state(0.0);
-            }
-
-            // Propagate signals through the synapses
-            // TODO: define additional logic to handle synaptic transmission and potential delay
-            // for synapse in &self.synapses {
-            //     synapse.transmit_signal();
-            // }
-
-            // Decode output here if needed, or store state for post-simulation analysis
-            let _output = self.decode_output();
-
-            // Placeholder: process the output as necessary, e.g., storing it, or using it in some way
-            //
+    /// Configures the network to simulate a specific logic gate.
+    pub fn configure_for_logic_gate(&mut self, gate_type: &str) {
+        match gate_type {
+            "AND" => self.configure_and_gate(),
+            "OR" => self.configure_or_gate(),
+            "NOT" => self.configure_not_gate(),
+            _ => panic!("Unsupported gate type"),
         }
+    }
+
+    fn configure_and_gate(&mut self) {
+        // For simplicity, assume neuron 0 is the output neuron, and neurons 1 and 2 are input neurons
+        self.connect_neurons(1, 0, 0.5, 1); // Input from neuron 1 to neuron 0
+        self.connect_neurons(2, 0, 0.5, 1); // Input from neuron 2 to neuron 0
+
+        if let Some(neuron) = self.neurons.get_mut(0) {
+            neuron.threshold = 0.9; // Set a higher threshold for AND logic
+        }
+    }
+
+    fn configure_or_gate(&mut self) {
+        // For simplicity, assume neuron 0 is the output neuron, and neurons 1 and 2 are input neurons
+        self.connect_neurons(1, 0, 0.5, 1); // Input from neuron 1 to neuron 0
+        self.connect_neurons(2, 0, 0.5, 1); // Input from neuron 2 to neuron 0
+
+        if let Some(neuron) = self.neurons.get_mut(0) {
+            neuron.threshold = 0.5; // Set a lower threshold for OR logic
+        }
+    }
+
+    fn configure_not_gate(&mut self) {
+        // Assuming neuron 0 is input and neuron 1 is output
+        self.set_input_neurons(vec![0]);
+        self.set_output_neurons(vec![1]);
+
+        // Configure the input neuron
+        self.neurons[0] = Neuron::new(0.5); // Low threshold
+
+        // Configure the output neuron
+        self.neurons[1] = Neuron::new(1.5); // Higher threshold
+
+        // Inhibitory connection from neuron 0 to neuron 1
+        self.connect_neurons(0, 1, -1.0, DEFAULT_DELAY);
+    }
+
+    pub fn run_simulation(&mut self, timesteps: usize, inputs: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+        let mut outputs = Vec::new();
+
+        // Collect the synapses for each neuron before mutating neuron states
+        let synapses_for_neurons: Vec<Vec<Synapse>> = self.neurons.iter().enumerate()
+            .map(|(idx, _)| self.get_synapses_for_neuron(idx))
+            .collect();
+
+
+        for input_values in inputs.iter() {
+            self.encode_input(input_values);
+
+            for timestep in 0..timesteps {
+                log::info!("Running timestep {}", timestep);
+                for (neuron, synapses) in self.neurons.iter_mut().zip(synapses_for_neurons.iter()) {
+                    neuron.update_state(
+                        0.0, // No external input current, since we're using encoded input val
+                        synapses
+                    );
+                }
+
+                // Propagate signals through the synapses
+                for synapse_option in self.synapses.0.iter() {
+                    if let Some(synapse) = synapse_option {
+                        let source_activity = self.neurons[synapse.source].membrane_potential;
+                        synapse.propagate_signal(source_activity, &mut self.neurons, timestep as u32);
+                    }
+                }
+                // Decode and process the output here if needed
+                let output = self.decode_output();
+                println!("Output at timestep {}: {:?}", timestep, output);
+                log::debug!("Output at timestep {}: {:?}", timestep, self.decode_output());
+            }
+            outputs.push(self.decode_output());
+        }
+        outputs
+
     }
 }

@@ -1,6 +1,5 @@
 //main.rs
-
-use clap::Parser;
+use crate::lnn::LiquidNeuralNetwork;
 use env_logger::Builder;
 use log::{info, LevelFilter};
 use ndarray::Array2;
@@ -17,15 +16,6 @@ mod output;
 
 mod ode_solver;
 
-
-
-// Define CLI arguments struct using Clap.
-#[derive(Parser)]
-#[clap(version = "1.0", author = "postrv")]
-struct Opts {
-    // TODO Define command line arguments here.
-}
-
 fn determine_neuron_count(inputs: &[Vec<f64>]) -> usize {
     // A simple example heuristic: set the neuron count to be
     // a multiple of the number of features from the input.
@@ -41,23 +31,34 @@ fn determine_neuron_count(inputs: &[Vec<f64>]) -> usize {
     }
 }
 
+fn test_logic_gate(lnn: &mut LiquidNeuralNetwork, gate_type: &str, test_inputs: Vec<Vec<f64>>) {
+    lnn.configure_for_logic_gate(gate_type);
+    let timesteps = 10; // Adjust as needed
+
+    for input in test_inputs {
+        let output = lnn.run_simulation(timesteps, vec![input.clone()]);
+        println!(
+            "Gate: {}, Input: {:?}, Output: {:?}",
+            gate_type, input, output.last().unwrap_or(&vec![])
+        );
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Initialize the logger
     Builder::new().filter(None, LevelFilter::Info).init();
 
-    // Parse the command line arguments
-    let _opts: Opts = Opts::parse();
+    log::info!("Initializing Liquid Neural Network");
 
     // The main logic of application will go here.
     // For now, we'll just log an information message.
+
     info!("Liquid Neural Network application started");
 
-    let inputs = input::read_input_from_csv("input_data.csv")?;
+    let inputs = input::read_input_from_csv("test_input_data.csv")?;
 
     let neuron_count = determine_neuron_count(&inputs); // implement this function
     let lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
-
-    // Here I will set up the neural network, start the simulation, etc.
 
     // Placeholder example of using ndarray, rand and rayon
     let _rng = rand::thread_rng();
@@ -81,6 +82,33 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Finalize application logic
     info!("Processing completed");
+
+    let mut lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
+
+    lnn.print_synapses();
+
+    test_logic_gate(
+        &mut lnn,
+        "AND",
+        vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+        ],
+    );
+    test_logic_gate(
+        &mut lnn,
+        "OR",
+        vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+        ],
+    );
+    lnn.print_synapses();
+    test_logic_gate(&mut lnn, "NOT", vec![vec![0.0], vec![1.0]]);
 
     Ok(())
 }
