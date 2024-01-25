@@ -17,19 +17,17 @@ mod output;
 mod ode_solver;
 
 fn determine_neuron_count(inputs: &[Vec<f64>]) -> usize {
-    // A simple example heuristic: set the neuron count to be
-    // a multiple of the number of features from the input.
-    // Adjust this heuristic based on experimental results.
+    // Determine neuron count based on the number of unique input vectors (rows)
+    let row_count = inputs.len();
+    let multiplier = 35; // Adjust this multiplier as needed
 
-    if let Some(first_input) = inputs.first() {
-        let feature_count = first_input.len();
-        let multiplier = 10; // Adjust this multiplier as needed
-        feature_count * multiplier
-    } else {
-        // Default to some minimum size if no input is found
-        100
-    }
+    // Use a minimum neuron count if the input set is empty or very small
+    let min_neuron_count = 150;
+
+    // Calculate neuron count, ensuring it's not below the minimum
+    std::cmp::max(row_count * multiplier, min_neuron_count)
 }
+
 
 fn test_logic_gate(lnn: &mut LiquidNeuralNetwork, gate_type: &str, test_inputs: Vec<Vec<f64>>) {
     lnn.configure_for_logic_gate(gate_type);
@@ -39,7 +37,9 @@ fn test_logic_gate(lnn: &mut LiquidNeuralNetwork, gate_type: &str, test_inputs: 
         let output = lnn.run_simulation(timesteps, vec![input.clone()]);
         println!(
             "Gate: {}, Input: {:?}, Output: {:?}",
-            gate_type, input, output.last().unwrap_or(&vec![])
+            gate_type,
+            input,
+            output.last().unwrap_or(&vec![])
         );
     }
 }
@@ -85,8 +85,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
 
-    lnn.print_synapses();
-
     test_logic_gate(
         &mut lnn,
         "AND",
@@ -107,8 +105,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             vec![1.0, 1.0],
         ],
     );
-    lnn.print_synapses();
-    test_logic_gate(&mut lnn, "NOT", vec![vec![0.0], vec![1.0]]);
+    test_logic_gate(&mut lnn,
+                    "NOT",
+                    vec!
+                    [vec![0.0],
+                     vec![1.0]
+                    ]
+    );
 
     Ok(())
 }

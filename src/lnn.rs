@@ -112,16 +112,24 @@ pub struct LiquidNeuralNetwork {
 }
 
 impl LiquidNeuralNetwork {
-    /// Creates a new Liquid Neural Network with a given number of neurons, and undefined input/output neurons.
+    /// Creates a new Liquid Neural Network with a given number of neurons.
     pub fn new(neuron_count: usize) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = rand::thread_rng();
         let neurons = (0..neuron_count)
-            .map(|_| Neuron::new(rng.gen_range(0.5..1.0))) // Randomly initialize neuron thresholds
+            .map(|_| Neuron::new(rng.gen_range(0.5..1.0)))
             .collect();
 
-        let mut synapses_array = Array::default((neuron_count, neuron_count));
-        for synapse_option in synapses_array.iter_mut() {
-            *synapse_option = None;
+        // Initialize synapses with random weights and delays
+        let mut synapses_array = Array2::default((neuron_count, neuron_count));
+        for i in 0..neuron_count {
+            for j in 0..neuron_count {
+                if i != j {
+                    // Avoid self-connections
+                    let weight = rng.gen_range(-1.0..1.0); // Random weight between -1.0 and 1.0
+                    let delay = rng.gen_range(1..5); // Random delay between 1 and 4
+                    synapses_array[[i, j]] = Some(Synapse::new(i, j, weight, delay));
+                }
+            }
         }
         let synapses = SynapsesWrapper(synapses_array);
 
@@ -138,8 +146,13 @@ impl LiquidNeuralNetwork {
         for (i, row) in self.synapses.0.outer_iter().enumerate() {
             for (j, synapse_option) in row.iter().enumerate() {
                 if let Some(synapse) = synapse_option {
-                    log::info!("Synapse from neuron {} to neuron {}: weight = {}, delay = {}",
-                           i, j, synapse.weight, synapse.delay);
+                    log::info!(
+                        "Synapse from neuron {} to neuron {}: weight = {}, delay = {}",
+                        i,
+                        j,
+                        synapse.weight,
+                        synapse.delay
+                    );
                 }
             }
         }
@@ -147,7 +160,8 @@ impl LiquidNeuralNetwork {
 
     /// Retrieves synapses connected to a specific neuron.
     pub fn get_synapses_for_neuron(&self, neuron_idx: usize) -> Vec<Synapse> {
-        self.synapses.0
+        self.synapses
+            .0
             .index_axis(ndarray::Axis(0), neuron_idx)
             .iter()
             .filter_map(|synapse_opt| synapse_opt.as_ref().cloned())
@@ -223,7 +237,8 @@ impl LiquidNeuralNetwork {
 
     /// Decodes the output from the network into a meaningful signal.
     pub fn decode_output(&self) -> Vec<f64> {
-        let output = self.output_indices
+        let output = self
+            .output_indices
             .iter()
             .filter_map(|&idx| self.neurons.get(idx))
             .map(|neuron| neuron.membrane_potential) // Read out the potentials as the output signal
@@ -278,8 +293,8 @@ impl LiquidNeuralNetwork {
             // Reset all relevant neuron state variables
             neuron.membrane_potential = 0.0;
             neuron.gating_variable = 0.0; // Resetting gating variable if used
-            neuron.recovery = 0.0;        // Resetting recovery variable if used
-            // Add other state resets as necessary
+            neuron.recovery = 0.0; // Resetting recovery variable if used
+                                   // Add other state resets as necessary
         }
         // Resetting synaptic states if required
         // TODO: Implement if dynamic synapses are used
@@ -334,10 +349,12 @@ impl LiquidNeuralNetwork {
         let mut outputs = Vec::new();
 
         // Collect the synapses for each neuron before mutating neuron states
-        let synapses_for_neurons: Vec<Vec<Synapse>> = self.neurons.iter().enumerate()
+        let synapses_for_neurons: Vec<Vec<Synapse>> = self
+            .neurons
+            .iter()
+            .enumerate()
             .map(|(idx, _)| self.get_synapses_for_neuron(idx))
             .collect();
-
 
         for input_values in inputs.iter() {
             self.encode_input(input_values);
@@ -347,7 +364,7 @@ impl LiquidNeuralNetwork {
                 for (neuron, synapses) in self.neurons.iter_mut().zip(synapses_for_neurons.iter()) {
                     neuron.update_state(
                         0.0, // No external input current, since we're using encoded input val
-                        synapses
+                        synapses,
                     );
                 }
 
@@ -355,17 +372,24 @@ impl LiquidNeuralNetwork {
                 for synapse_option in self.synapses.0.iter() {
                     if let Some(synapse) = synapse_option {
                         let source_activity = self.neurons[synapse.source].membrane_potential;
-                        synapse.propagate_signal(source_activity, &mut self.neurons, timestep as u32);
+                        synapse.propagate_signal(
+                            source_activity,
+                            &mut self.neurons,
+                            timestep as u32,
+                        );
                     }
                 }
                 // Decode and process the output here if needed
                 let output = self.decode_output();
                 println!("Output at timestep {}: {:?}", timestep, output);
-                log::debug!("Output at timestep {}: {:?}", timestep, self.decode_output());
+                log::debug!(
+                    "Output at timestep {}: {:?}",
+                    timestep,
+                    self.decode_output()
+                );
             }
             outputs.push(self.decode_output());
         }
         outputs
-
     }
 }
