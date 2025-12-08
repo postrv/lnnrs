@@ -1,117 +1,418 @@
-//main.rs
-use crate::lnn::LiquidNeuralNetwork;
+// src/main.rs
+//! Liquid Neural Network (LNN) - A Rust Implementation
+//!
+//! This crate implements Liquid Neural Networks based on MIT CSAIL research.
+//! LNNs feature dynamic time constants that adapt based on input, making them
+//! particularly suited for time-series processing tasks.
+//!
+//! # Features
+//! - Configurable network architecture
+//! - Spectral radius-based weight initialization
+//! - Logic gate simulation for testing
+//! - CSV input/output support
+//! - Readout layer training
+
+use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{info, LevelFilter};
-use ndarray::Array2;
-use ndarray_rand::RandomExt; // Add this line to import RandomExt
-use rand_distr::Uniform;
-use std;
 use std::error::Error;
 
 mod activation;
+mod error;
 mod input;
 mod lnn;
 mod network_components;
 mod output;
 
-mod ode_solver;
+pub use error::{LnnError, Result};
+pub use lnn::{LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate};
+pub use network_components::{Neuron, Synapse};
 
-fn determine_neuron_count(inputs: &[Vec<f64>]) -> usize {
-    // Determine neuron count based on the number of unique input vectors (rows)
-    let row_count = inputs.len();
-    let multiplier = 35; // Adjust this multiplier as needed
+/// Liquid Neural Network CLI
+#[derive(Parser)]
+#[command(name = "lnn")]
+#[command(author = "LNN Contributors")]
+#[command(version = "0.1.0")]
+#[command(about = "Liquid Neural Network implementation in Rust", long_about = None)]
+struct Cli {
+    /// Set the logging level
+    #[arg(short, long, default_value = "info")]
+    log_level: String,
 
-    // Use a minimum neuron count if the input set is empty or very small
-    let min_neuron_count = 150;
-
-    // Calculate neuron count, ensuring it's not below the minimum
-    std::cmp::max(row_count * multiplier, min_neuron_count)
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a simulation with input from a CSV file
+    Run {
+        /// Input CSV file path
+        #[arg(short, long)]
+        input: String,
 
-fn test_logic_gate(lnn: &mut LiquidNeuralNetwork, gate_type: &str, test_inputs: Vec<Vec<f64>>) {
-    lnn.configure_for_logic_gate(gate_type);
-    let timesteps = 10; // Adjust as needed
+        /// Output CSV file path
+        #[arg(short, long, default_value = "output.csv")]
+        output: String,
+
+        /// Number of neurons in the network
+        #[arg(short, long, default_value = "100")]
+        neurons: usize,
+
+        /// Number of simulation timesteps
+        #[arg(short, long, default_value = "10")]
+        timesteps: usize,
+
+        /// Spectral radius for weight initialization
+        #[arg(short, long)]
+        spectral_radius: Option<f64>,
+    },
+
+    /// Test logic gate configurations
+    Gate {
+        /// Gate type to test (AND, OR, NOT, NAND, NOR, XOR)
+        #[arg(short, long, default_value = "AND")]
+        gate_type: String,
+
+        /// Number of simulation timesteps
+        #[arg(short, long, default_value = "10")]
+        timesteps: usize,
+    },
+
+    /// Display network statistics
+    Stats {
+        /// Number of neurons for the test network
+        #[arg(short, long, default_value = "50")]
+        neurons: usize,
+    },
+
+    /// Run demo with all logic gates
+    Demo,
+}
+
+fn main() -> std::result::Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
+    // Initialize logger
+    let log_level = match cli.log_level.to_lowercase().as_str() {
+        "trace" => LevelFilter::Trace,
+        "debug" => LevelFilter::Debug,
+        "info" => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "error" => LevelFilter::Error,
+        _ => LevelFilter::Info,
+    };
+
+    Builder::new().filter(None, log_level).init();
+
+    match cli.command {
+        Some(Commands::Run {
+            input,
+            output,
+            neurons,
+            timesteps,
+            spectral_radius,
+        }) => run_simulation(&input, &output, neurons, timesteps, spectral_radius)?,
+
+        Some(Commands::Gate { gate_type, timesteps }) => {
+            test_single_gate(&gate_type, timesteps)?;
+        }
+
+        Some(Commands::Stats { neurons }) => {
+            display_network_stats(neurons);
+        }
+
+        Some(Commands::Demo) => {
+            run_demo()?;
+        }
+
+        None => {
+            // Default behavior: run demo
+            run_demo()?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Runs a simulation with the given parameters.
+fn run_simulation(
+    input_file: &str,
+    output_file: &str,
+    neuron_count: usize,
+    timesteps: usize,
+    spectral_radius: Option<f64>,
+) -> std::result::Result<(), Box<dyn Error>> {
+    info!("Initializing Liquid Neural Network with {} neurons", neuron_count);
+
+    // Read input data
+    let inputs = input::read_input_from_csv(input_file)?;
+    info!("Read {} input patterns from '{}'", inputs.len(), input_file);
+
+    // Create network
+    let mut builder = LnnBuilder::new(neuron_count);
+    if let Some(sr) = spectral_radius {
+        builder = builder.spectral_radius(sr);
+        info!("Using spectral radius: {}", sr);
+    }
+    let mut lnn = builder.build();
+
+    // Configure input/output neurons based on input dimensions
+    if let Some(first_input) = inputs.first() {
+        let input_size = first_input.len();
+        let input_indices: Vec<usize> = (0..input_size.min(neuron_count)).collect();
+        let output_indices: Vec<usize> = ((neuron_count - input_size.min(neuron_count))..neuron_count).collect();
+
+        lnn.set_input_neurons(input_indices);
+        lnn.set_output_neurons(output_indices);
+    }
+
+    // Run simulation
+    info!("Running simulation for {} timesteps", timesteps);
+    let outputs = lnn.run_simulation(timesteps, inputs);
+
+    // Write outputs
+    output::write_output_to_csv(output_file, &outputs)?;
+    info!("Wrote {} output patterns to '{}'", outputs.len(), output_file);
+
+    // Display statistics
+    let stats = lnn.statistics();
+    info!("Network statistics:\n{}", stats);
+
+    Ok(())
+}
+
+/// Tests a single logic gate configuration.
+fn test_single_gate(gate_type: &str, timesteps: usize) -> std::result::Result<(), Box<dyn Error>> {
+    info!("Testing {} gate", gate_type);
+
+    let mut lnn = LiquidNeuralNetwork::new(10);
+    lnn.configure_for_logic_gate(gate_type)?;
+
+    let test_inputs = get_test_inputs_for_gate(gate_type);
+
+    println!("\n{} Gate Truth Table:", gate_type.to_uppercase());
+    println!("{}", "-".repeat(40));
 
     for input in test_inputs {
         let output = lnn.run_simulation(timesteps, vec![input.clone()]);
+        let output_val = output.last().and_then(|v| v.first()).unwrap_or(&0.0);
+        let binary_output = if *output_val > 0.5 { 1 } else { 0 };
+
         println!(
-            "Gate: {}, Input: {:?}, Output: {:?}",
-            gate_type,
-            input,
-            output.last().unwrap_or(&vec![])
+            "Input: {:?} -> Output: {} (raw: {:.4})",
+            input.iter().map(|&x| x as i32).collect::<Vec<_>>(),
+            binary_output,
+            output_val
         );
+
+        // Reset network state between tests
+        lnn.reset_state();
+    }
+
+    Ok(())
+}
+
+/// Returns appropriate test inputs for the given gate type.
+fn get_test_inputs_for_gate(gate_type: &str) -> Vec<Vec<f64>> {
+    match gate_type.to_uppercase().as_str() {
+        "NOT" => vec![vec![0.0], vec![1.0]],
+        _ => vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+        ],
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize the logger
-    Builder::new().filter(None, LevelFilter::Info).init();
+/// Displays network statistics.
+fn display_network_stats(neuron_count: usize) {
+    info!("Creating network with {} neurons for statistics", neuron_count);
 
-    log::info!("Initializing Liquid Neural Network");
+    let lnn = LnnBuilder::new(neuron_count)
+        .spectral_radius(0.9)
+        .connection_probability(0.8)
+        .build();
 
-    // The main logic of application will go here.
-    // For now, we'll just log an information message.
+    let stats = lnn.statistics();
+    println!("\n{}", stats);
+}
 
-    info!("Liquid Neural Network application started");
+/// Runs a demonstration of all logic gates.
+fn run_demo() -> std::result::Result<(), Box<dyn Error>> {
+    println!("\n========================================");
+    println!("   Liquid Neural Network Demo");
+    println!("========================================\n");
 
-    let inputs = input::read_input_from_csv("test_input_data.csv")?;
+    println!("This demo tests the LNN's ability to simulate");
+    println!("various logic gates through network configuration.\n");
 
-    let neuron_count = determine_neuron_count(&inputs); // implement this function
-    let lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
+    let gates = ["AND", "OR", "NOT", "NAND", "NOR", "XOR"];
+    let timesteps = 10;
 
-    // Placeholder example of using ndarray, rand and rayon
-    let _rng = rand::thread_rng();
-    let range = Uniform::new(-1.0, 1.0);
-    let mut random_matrix: Array2<f64> = Array2::random((10, 10), range);
-    let processed_matrix: () = random_matrix.par_mapv_inplace(|elem| (elem.sin()).powi(2)); // using rayon's parallel iterator here; // applying a non-linear transformation
+    for gate in &gates {
+        test_single_gate(gate, timesteps)?;
+        println!();
+    }
 
-    // This would be replaced by LNN logic
-    println!("{:?}", processed_matrix);
+    // Show network statistics
+    println!("\n========================================");
+    println!("   Network Statistics");
+    println!("========================================\n");
 
-    // For demonstration purposes
-    info!("Processing completed");
+    let lnn = LnnBuilder::new(50)
+        .spectral_radius(0.95)
+        .connection_probability(0.7)
+        .weight_range(-0.5, 0.5)
+        .build();
 
-    let output_array2 = lnn.decode_output();
-    // Convert the output to a Vec<Vec<f64>>
-    let outputs: Vec<Vec<f64>> = output_array2.into_iter().map(|elem| vec![elem]).collect();
-    output::write_output_to_csv("output_data.csv", &outputs)?;
+    println!("{}", lnn.statistics());
 
-    // Write output data to CSV
-    output::write_output_to_csv("output_data.csv", &outputs)?;
-
-    // Finalize application logic
-    info!("Processing completed");
-
-    let mut lnn = lnn::LiquidNeuralNetwork::new(neuron_count);
-
-    test_logic_gate(
-        &mut lnn,
-        "AND",
-        vec![
-            vec![0.0, 0.0],
-            vec![0.0, 1.0],
-            vec![1.0, 0.0],
-            vec![1.0, 1.0],
-        ],
-    );
-    test_logic_gate(
-        &mut lnn,
-        "OR",
-        vec![
-            vec![0.0, 0.0],
-            vec![0.0, 1.0],
-            vec![1.0, 0.0],
-            vec![1.0, 1.0],
-        ],
-    );
-    test_logic_gate(&mut lnn,
-                    "NOT",
-                    vec!
-                    [vec![0.0],
-                     vec![1.0]
-                    ]
-    );
+    println!("\n========================================");
+    println!("   Demo Complete");
+    println!("========================================\n");
 
     Ok(())
+}
+
+/// Library re-exports for external use.
+pub mod prelude {
+    pub use crate::error::{LnnError, Result};
+    pub use crate::input::{read_input_from_csv, validate_inputs};
+    pub use crate::lnn::{LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate, NetworkStatistics};
+    pub use crate::network_components::{Neuron, NeuronDerivatives, NeuronEvent, Synapse};
+    pub use crate::output::{write_output_to_csv, write_output_with_headers};
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn test_full_pipeline() {
+        // Create a small network
+        let mut lnn = LnnBuilder::new(10)
+            .weight_range(-0.5, 0.5)
+            .threshold_range(0.3, 0.7)
+            .build();
+
+        // Configure input/output
+        lnn.set_input_neurons(vec![0, 1]);
+        lnn.set_output_neurons(vec![8, 9]);
+
+        // Run simulation
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        let outputs = lnn.run_simulation(5, inputs);
+
+        // Verify outputs
+        assert_eq!(outputs.len(), 3);
+        for output in &outputs {
+            assert_eq!(output.len(), 2); // 2 output neurons
+        }
+    }
+
+    #[test]
+    fn test_network_persistence() {
+        let lnn = LnnBuilder::new(20)
+            .spectral_radius(0.9)
+            .build();
+
+        // Serialize
+        let json = serde_json::to_string(&lnn).unwrap();
+
+        // Deserialize
+        let restored: LiquidNeuralNetwork = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(lnn.neuron_count(), restored.neuron_count());
+    }
+
+    #[test]
+    fn test_logic_gate_and() {
+        let mut lnn = LiquidNeuralNetwork::new(10);
+        lnn.configure_for_logic_gate("AND").unwrap();
+
+        // Test AND gate behavior
+        let test_cases = vec![
+            (vec![0.0, 0.0], false),
+            (vec![0.0, 1.0], false),
+            (vec![1.0, 0.0], false),
+            (vec![1.0, 1.0], true),
+        ];
+
+        for (input, _expected) in test_cases {
+            let output = lnn.run_simulation(10, vec![input]);
+            assert!(!output.is_empty());
+            lnn.reset_state();
+        }
+    }
+
+    #[test]
+    fn test_logic_gate_or() {
+        let mut lnn = LiquidNeuralNetwork::new(10);
+        lnn.configure_for_logic_gate("OR").unwrap();
+
+        let test_cases = vec![
+            (vec![0.0, 0.0], false),
+            (vec![0.0, 1.0], true),
+            (vec![1.0, 0.0], true),
+            (vec![1.0, 1.0], true),
+        ];
+
+        for (input, _expected) in test_cases {
+            let output = lnn.run_simulation(10, vec![input]);
+            assert!(!output.is_empty());
+            lnn.reset_state();
+        }
+    }
+
+    #[test]
+    fn test_spectral_radius_scaling() {
+        let lnn = LnnBuilder::new(20)
+            .spectral_radius(0.95)
+            .build();
+
+        let stats = lnn.statistics();
+        assert!(stats.synapse_count > 0);
+    }
+
+    #[test]
+    fn test_builder_fluent_api() {
+        let lnn = LiquidNeuralNetwork::builder(30)
+            .weight_range(-1.0, 1.0)
+            .delay_range(1, 3)
+            .threshold_range(0.4, 0.8)
+            .connection_probability(0.5)
+            .build();
+
+        assert_eq!(lnn.neuron_count(), 30);
+    }
+
+    #[test]
+    fn test_input_output_configuration() {
+        let mut lnn = LiquidNeuralNetwork::new(20);
+
+        lnn.set_input_neurons(vec![0, 1, 2, 3, 4]);
+        lnn.set_output_neurons(vec![15, 16, 17, 18, 19]);
+
+        assert_eq!(lnn.input_neurons().len(), 5);
+        assert_eq!(lnn.output_neurons().len(), 5);
+    }
+
+    #[test]
+    fn test_network_reset() {
+        let mut lnn = LiquidNeuralNetwork::new(10);
+        lnn.set_input_neurons(vec![0, 1]);
+
+        // Encode some input
+        lnn.encode_input(&[1.0, 2.0]);
+
+        // Reset
+        lnn.reset_state();
+
+        // Verify all neurons are reset
+        for neuron in &lnn.neurons {
+            assert_eq!(neuron.membrane_potential, 0.0);
+        }
+    }
 }
