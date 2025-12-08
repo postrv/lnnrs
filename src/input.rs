@@ -7,9 +7,9 @@ use crate::error::{LnnError, Result};
 use std::fs::File;
 use std::path::Path;
 
-/// Reads input data from a CSV file into a Vec<Vec<f64>>.
+/// Reads input data from a CSV file into a `Vec<Vec<f64>>`.
 ///
-/// Each row in the CSV file becomes a Vec<f64> containing the parsed values.
+/// Each row in the CSV file becomes a `Vec<f64>` containing the parsed values.
 /// Non-numeric values are parsed as 0.0.
 ///
 /// # Arguments
@@ -115,8 +115,8 @@ pub fn validate_inputs(inputs: &[Vec<f64>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_read_from_string() {

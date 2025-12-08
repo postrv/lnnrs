@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// Writes output data to a CSV file.
 ///
-/// Each Vec<f64> in the outputs becomes a row in the CSV file.
+/// Each `Vec<f64>` in the outputs becomes a row in the CSV file.
 ///
 /// # Arguments
 /// * `file_path` - Path to the output CSV file
@@ -33,7 +33,11 @@ pub fn write_output_to_csv<P: AsRef<Path>>(file_path: P, outputs: &[Vec<f64>]) -
     }
 
     wtr.flush()?;
-    log::debug!("Wrote {} output rows to '{}'", outputs.len(), path.display());
+    log::debug!(
+        "Wrote {} output rows to '{}'",
+        outputs.len(),
+        path.display()
+    );
     Ok(())
 }
 
@@ -54,9 +58,9 @@ pub fn write_output_to_string(outputs: &[Vec<f64>]) -> Result<String> {
         wtr.write_record(output.iter().map(|&val| val.to_string()))?;
     }
 
-    let data = wtr.into_inner().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-    })?;
+    let data = wtr
+        .into_inner()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     Ok(String::from_utf8_lossy(&data).to_string())
 }
@@ -99,8 +103,8 @@ pub fn write_output_with_headers<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::fs;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_write_to_string() {

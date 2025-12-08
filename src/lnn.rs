@@ -519,10 +519,16 @@ impl LiquidNeuralNetwork {
         delay: u32,
     ) -> Result<()> {
         if pre_idx >= self.neurons.len() {
-            return Err(LnnError::index_out_of_bounds(pre_idx, self.neurons.len() - 1));
+            return Err(LnnError::index_out_of_bounds(
+                pre_idx,
+                self.neurons.len() - 1,
+            ));
         }
         if post_idx >= self.neurons.len() {
-            return Err(LnnError::index_out_of_bounds(post_idx, self.neurons.len() - 1));
+            return Err(LnnError::index_out_of_bounds(
+                post_idx,
+                self.neurons.len() - 1,
+            ));
         }
         if pre_idx == post_idx {
             return Err(LnnError::configuration("Cannot create self-connection"));
@@ -585,9 +591,7 @@ impl LiquidNeuralNetwork {
             return Err(LnnError::Training("No training inputs provided".into()));
         }
         if inputs.len() != expected_outputs.len() {
-            return Err(LnnError::Training(
-                "Input and output count mismatch".into(),
-            ));
+            return Err(LnnError::Training("Input and output count mismatch".into()));
         }
 
         let mut readout_inputs: Vec<Vec<f64>> = Vec::with_capacity(inputs.len());
@@ -827,7 +831,11 @@ impl LiquidNeuralNetwork {
                     }
                 }
 
-                log::debug!("Output at timestep {}: {:?}", timestep, self.decode_output());
+                log::debug!(
+                    "Output at timestep {}: {:?}",
+                    timestep,
+                    self.decode_output()
+                );
             }
 
             outputs.push(self.decode_output());
@@ -896,7 +904,6 @@ impl fmt::Display for NetworkStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_relative_eq;
 
     mod config_tests {
         use super::*;
@@ -947,9 +954,7 @@ mod tests {
 
         #[test]
         fn test_builder_with_spectral_radius() {
-            let lnn = LnnBuilder::new(10)
-                .spectral_radius(0.95)
-                .build();
+            let lnn = LnnBuilder::new(10).spectral_radius(0.95).build();
 
             assert_eq!(lnn.neuron_count(), 10);
         }

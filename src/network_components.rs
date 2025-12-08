@@ -163,8 +163,8 @@ impl Neuron {
         // Uses the neuron's rest_potential (0.0 for logic gates, -69.0 for biological)
         // dt is the simulation time step (1.0 ms)
         const DT: f64 = 1.0;
-        let leakage_rate = (self.rest_potential - self.membrane_potential)
-            / config::MEMBRANE_TIME_CONSTANT;
+        let leakage_rate =
+            (self.rest_potential - self.membrane_potential) / config::MEMBRANE_TIME_CONSTANT;
         self.membrane_potential +=
             (input_current * config::MEMBRANE_RESISTANCE + leakage_rate) * DT;
 
@@ -669,10 +669,7 @@ mod tests {
         #[test]
         fn test_neuron_fires_with_connected_synapse() {
             setup();
-            let mut neurons = vec![
-                Neuron::with_id(0, 0.5),
-                Neuron::with_id(1, 0.5),
-            ];
+            let mut neurons = vec![Neuron::with_id(0, 0.5), Neuron::with_id(1, 0.5)];
             let synapse = Synapse::new(0, 1, 0.8, 0);
             let synapses = vec![synapse.clone()];
 

@@ -1,32 +1,27 @@
 // src/main.rs
-//! Liquid Neural Network (LNN) - A Rust Implementation
+//! Liquid Neural Network (LNN) CLI - A Rust Implementation
 //!
-//! This crate implements Liquid Neural Networks based on MIT CSAIL research.
-//! LNNs feature dynamic time constants that adapt based on input, making them
-//! particularly suited for time-series processing tasks.
+//! This binary provides a command-line interface for the Liquid Neural Network library.
 //!
-//! # Features
-//! - Configurable network architecture
-//! - Spectral radius-based weight initialization
-//! - Logic gate simulation for testing
-//! - CSV input/output support
-//! - Readout layer training
+//! # Usage
+//! ```bash
+//! # Run demo
+//! lnn demo
+//!
+//! # Test LTC network
+//! lnn ltc -u 32 -l 100
+//!
+//! # Test CfC network
+//! lnn cfc -u 32 -l 100
+//! ```
 
 use clap::{Parser, Subcommand};
 use env_logger::Builder;
 use log::{info, LevelFilter};
 use std::error::Error;
 
-mod activation;
-mod error;
-mod input;
-mod lnn;
-mod network_components;
-mod output;
-
-pub use error::{LnnError, Result};
-pub use lnn::{LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate};
-pub use network_components::{Neuron, Synapse};
+use liquid_neural_network::prelude::*;
+use liquid_neural_network::{cfc, input, ltc, output};
 
 /// Liquid Neural Network CLI
 #[derive(Parser)]
@@ -88,6 +83,47 @@ enum Commands {
 
     /// Run demo with all logic gates
     Demo,
+
+    /// Test LTC (Liquid Time-Constant) network on a time series
+    Ltc {
+        /// Number of hidden units
+        #[arg(short = 'u', long, default_value = "32")]
+        units: usize,
+
+        /// Length of the sequence
+        #[arg(short, long, default_value = "100")]
+        length: usize,
+    },
+
+    /// Test CfC (Closed-form Continuous) network on a time series
+    Cfc {
+        /// Number of hidden units
+        #[arg(short = 'u', long, default_value = "32")]
+        units: usize,
+
+        /// Length of the sequence
+        #[arg(short, long, default_value = "100")]
+        length: usize,
+
+        /// Use no-gate mode (faster)
+        #[arg(long)]
+        no_gate: bool,
+    },
+
+    /// Run time-series prediction example
+    TimeSeries {
+        /// Model type: ltc, cfc, or lnn
+        #[arg(short, long, default_value = "cfc")]
+        model: String,
+
+        /// Number of hidden units
+        #[arg(short = 'u', long, default_value = "32")]
+        units: usize,
+
+        /// Prediction task: sine, square, or sawtooth
+        #[arg(short, long, default_value = "sine")]
+        task: String,
+    },
 }
 
 fn main() -> std::result::Result<(), Box<dyn Error>> {
@@ -114,7 +150,10 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             spectral_radius,
         }) => run_simulation(&input, &output, neurons, timesteps, spectral_radius)?,
 
-        Some(Commands::Gate { gate_type, timesteps }) => {
+        Some(Commands::Gate {
+            gate_type,
+            timesteps,
+        }) => {
             test_single_gate(&gate_type, timesteps)?;
         }
 
@@ -124,6 +163,22 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
 
         Some(Commands::Demo) => {
             run_demo()?;
+        }
+
+        Some(Commands::Ltc { units, length }) => {
+            test_ltc_network(units, length)?;
+        }
+
+        Some(Commands::Cfc {
+            units,
+            length,
+            no_gate,
+        }) => {
+            test_cfc_network(units, length, no_gate)?;
+        }
+
+        Some(Commands::TimeSeries { model, units, task }) => {
+            run_time_series_example(&model, units, &task)?;
         }
 
         None => {
@@ -143,7 +198,10 @@ fn run_simulation(
     timesteps: usize,
     spectral_radius: Option<f64>,
 ) -> std::result::Result<(), Box<dyn Error>> {
-    info!("Initializing Liquid Neural Network with {} neurons", neuron_count);
+    info!(
+        "Initializing Liquid Neural Network with {} neurons",
+        neuron_count
+    );
 
     // Read input data
     let inputs = input::read_input_from_csv(input_file)?;
@@ -161,7 +219,8 @@ fn run_simulation(
     if let Some(first_input) = inputs.first() {
         let input_size = first_input.len();
         let input_indices: Vec<usize> = (0..input_size.min(neuron_count)).collect();
-        let output_indices: Vec<usize> = ((neuron_count - input_size.min(neuron_count))..neuron_count).collect();
+        let output_indices: Vec<usize> =
+            ((neuron_count - input_size.min(neuron_count))..neuron_count).collect();
 
         lnn.set_input_neurons(input_indices);
         lnn.set_output_neurons(output_indices);
@@ -173,7 +232,11 @@ fn run_simulation(
 
     // Write outputs
     output::write_output_to_csv(output_file, &outputs)?;
-    info!("Wrote {} output patterns to '{}'", outputs.len(), output_file);
+    info!(
+        "Wrote {} output patterns to '{}'",
+        outputs.len(),
+        output_file
+    );
 
     // Display statistics
     let stats = lnn.statistics();
@@ -228,7 +291,10 @@ fn get_test_inputs_for_gate(gate_type: &str) -> Vec<Vec<f64>> {
 
 /// Displays network statistics.
 fn display_network_stats(neuron_count: usize) {
-    info!("Creating network with {} neurons for statistics", neuron_count);
+    info!(
+        "Creating network with {} neurons for statistics",
+        neuron_count
+    );
 
     let lnn = LnnBuilder::new(neuron_count)
         .spectral_radius(0.9)
@@ -276,18 +342,215 @@ fn run_demo() -> std::result::Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Library re-exports for external use.
-pub mod prelude {
-    pub use crate::error::{LnnError, Result};
-    pub use crate::input::{read_input_from_csv, validate_inputs};
-    pub use crate::lnn::{LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate, NetworkStatistics};
-    pub use crate::network_components::{Neuron, NeuronDerivatives, NeuronEvent, Synapse};
-    pub use crate::output::{write_output_to_csv, write_output_with_headers};
+/// Tests the LTC (Liquid Time-Constant) network.
+fn test_ltc_network(units: usize, length: usize) -> std::result::Result<(), Box<dyn Error>> {
+    use ltc::LtcNetwork;
+
+    println!("\n========================================");
+    println!("   LTC Network Test");
+    println!("========================================\n");
+
+    println!("Configuration:");
+    println!("  Hidden units: {}", units);
+    println!("  Sequence length: {}", length);
+
+    // Create network: 2 inputs (sin, cos), hidden units, 1 output
+    let network = LtcNetwork::new(2, units, 1);
+
+    // Generate sine wave input
+    let inputs: Vec<Vec<f64>> = (0..length)
+        .map(|i| {
+            let t = i as f64 * 0.1;
+            vec![t.sin(), t.cos()]
+        })
+        .collect();
+
+    // Process sequence
+    let start = std::time::Instant::now();
+    let outputs = network.forward_sequence(&inputs);
+    let elapsed = start.elapsed();
+
+    println!("\nResults:");
+    println!("  Processing time: {:?}", elapsed);
+    println!("  Output samples (first 5):");
+    for (i, output) in outputs.iter().take(5).enumerate() {
+        let t = i as f64 * 0.1;
+        println!(
+            "    t={:.1}: input=({:.3}, {:.3}) -> output={:.4}",
+            t, inputs[i][0], inputs[i][1], output[0]
+        );
+    }
+
+    // Verify outputs are bounded
+    let all_finite = outputs.iter().all(|o| o.iter().all(|&v| v.is_finite()));
+    println!("\n  All outputs finite: {}", all_finite);
+
+    if !all_finite {
+        return Err("LTC network produced non-finite values".into());
+    }
+
+    println!("\n✓ LTC network test passed!");
+    Ok(())
+}
+
+/// Tests the CfC (Closed-form Continuous) network.
+fn test_cfc_network(
+    units: usize,
+    length: usize,
+    no_gate: bool,
+) -> std::result::Result<(), Box<dyn Error>> {
+    use cfc::CfcBuilder;
+
+    println!("\n========================================");
+    println!("   CfC Network Test");
+    println!("========================================\n");
+
+    println!("Configuration:");
+    println!("  Hidden units: {}", units);
+    println!("  Sequence length: {}", length);
+    println!("  No-gate mode: {}", no_gate);
+
+    // Create network
+    let network = CfcBuilder::new(2, 1)
+        .hidden_units(units)
+        .no_gate(no_gate)
+        .build();
+
+    // Generate sine wave input
+    let inputs: Vec<Vec<f64>> = (0..length)
+        .map(|i| {
+            let t = i as f64 * 0.1;
+            vec![t.sin(), t.cos()]
+        })
+        .collect();
+
+    // Process sequence
+    let start = std::time::Instant::now();
+    let outputs = network.forward_sequence(&inputs);
+    let elapsed = start.elapsed();
+
+    println!("\nResults:");
+    println!("  Processing time: {:?}", elapsed);
+    println!("  Output samples (first 5):");
+    for (i, output) in outputs.iter().take(5).enumerate() {
+        let t = i as f64 * 0.1;
+        println!(
+            "    t={:.1}: input=({:.3}, {:.3}) -> output={:.4}",
+            t, inputs[i][0], inputs[i][1], output[0]
+        );
+    }
+
+    // Verify outputs are bounded
+    let all_finite = outputs.iter().all(|o| o.iter().all(|&v| v.is_finite()));
+    println!("\n  All outputs finite: {}", all_finite);
+
+    if !all_finite {
+        return Err("CfC network produced non-finite values".into());
+    }
+
+    println!("\n✓ CfC network test passed!");
+    Ok(())
+}
+
+/// Runs a time-series prediction example.
+fn run_time_series_example(
+    model: &str,
+    units: usize,
+    task: &str,
+) -> std::result::Result<(), Box<dyn Error>> {
+    use cfc::CfcBuilder;
+    use ltc::LtcNetwork;
+
+    println!("\n========================================");
+    println!("   Time Series Prediction Example");
+    println!("========================================\n");
+
+    println!("Configuration:");
+    println!("  Model: {}", model);
+    println!("  Hidden units: {}", units);
+    println!("  Task: {} wave prediction", task);
+
+    // Generate target signal
+    let length = 200;
+    let targets: Vec<f64> = (0..length)
+        .map(|i| {
+            let t = i as f64 * 0.05;
+            match task {
+                "square" => {
+                    if (t * 2.0).sin() > 0.0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
+                "sawtooth" => (t % (2.0 * std::f64::consts::PI)) / std::f64::consts::PI - 1.0,
+                _ => t.sin(), // sine wave by default
+            }
+        })
+        .collect();
+
+    // Create input sequence (shifted target, simulating prediction task)
+    let inputs: Vec<Vec<f64>> = (0..length)
+        .map(|i| {
+            let prev = if i > 0 { targets[i - 1] } else { 0.0 };
+            vec![prev, (i as f64 * 0.05).cos()]
+        })
+        .collect();
+
+    // Run with selected model
+    let outputs = match model.to_lowercase().as_str() {
+        "ltc" => {
+            let network = LtcNetwork::new(2, units, 1);
+            network.forward_sequence(&inputs)
+        }
+        "cfc" => {
+            let network = CfcBuilder::new(2, 1).hidden_units(units).build();
+            network.forward_sequence(&inputs)
+        }
+        _ => {
+            // Use classic LNN
+            let mut lnn = LiquidNeuralNetwork::new(units);
+            lnn.set_input_neurons(vec![0, 1]);
+            lnn.set_output_neurons(vec![units - 1]);
+            let converted_inputs: Vec<Vec<f64>> = inputs.clone();
+            lnn.run_simulation(1, converted_inputs)
+        }
+    };
+
+    // Calculate MSE (just for demonstration, not actual training)
+    let mse: f64 = outputs
+        .iter()
+        .zip(targets.iter())
+        .map(|(o, &t)| (o[0] - t).powi(2))
+        .sum::<f64>()
+        / length as f64;
+
+    println!("\nResults:");
+    println!("  Mean Squared Error: {:.6}", mse);
+    println!("\n  Sample predictions (showing every 20th step):");
+    println!(
+        "    {:>6} {:>10} {:>10} {:>10}",
+        "Step", "Target", "Predicted", "Error"
+    );
+    for i in (0..length).step_by(20) {
+        let target = targets[i];
+        let predicted = outputs[i][0];
+        let error = (target - predicted).abs();
+        println!(
+            "    {:>6} {:>10.4} {:>10.4} {:>10.4}",
+            i, target, predicted, error
+        );
+    }
+
+    println!("\nNote: This is a forward pass demonstration. The network is not trained,");
+    println!("so predictions are based on random initial weights.");
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod integration_tests {
-    use super::*;
+    use liquid_neural_network::prelude::*;
 
     #[test]
     fn test_full_pipeline() {
@@ -314,9 +577,7 @@ mod integration_tests {
 
     #[test]
     fn test_network_persistence() {
-        let lnn = LnnBuilder::new(20)
-            .spectral_radius(0.9)
-            .build();
+        let lnn = LnnBuilder::new(20).spectral_radius(0.9).build();
 
         // Serialize
         let json = serde_json::to_string(&lnn).unwrap();
@@ -368,9 +629,7 @@ mod integration_tests {
 
     #[test]
     fn test_spectral_radius_scaling() {
-        let lnn = LnnBuilder::new(20)
-            .spectral_radius(0.95)
-            .build();
+        let lnn = LnnBuilder::new(20).spectral_radius(0.95).build();
 
         let stats = lnn.statistics();
         assert!(stats.synapse_count > 0);

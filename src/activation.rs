@@ -86,7 +86,11 @@ pub fn relu(x: f64) -> f64 {
 /// 1.0 if x > 0, otherwise 0.0
 #[inline]
 pub fn relu_derivative(x: f64) -> f64 {
-    if x > 0.0 { 1.0 } else { 0.0 }
+    if x > 0.0 {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// Applies the Leaky ReLU activation function.
@@ -101,7 +105,11 @@ pub fn relu_derivative(x: f64) -> f64 {
 /// The input if positive, otherwise alpha * input
 #[inline]
 pub fn leaky_relu(x: f64, alpha: f64) -> f64 {
-    if x > 0.0 { x } else { alpha * x }
+    if x > 0.0 {
+        x
+    } else {
+        alpha * x
+    }
 }
 
 /// Computes the derivative of the Leaky ReLU function.
@@ -114,7 +122,11 @@ pub fn leaky_relu(x: f64, alpha: f64) -> f64 {
 /// 1.0 if x > 0, otherwise alpha
 #[inline]
 pub fn leaky_relu_derivative(x: f64, alpha: f64) -> f64 {
-    if x > 0.0 { 1.0 } else { alpha }
+    if x > 0.0 {
+        1.0
+    } else {
+        alpha
+    }
 }
 
 /// Applies the softplus activation function.
@@ -284,21 +296,9 @@ mod tests {
             sigmoid(x),
             epsilon = 1e-10
         );
-        assert_relative_eq!(
-            ActivationFunction::Tanh.apply(x),
-            tanh(x),
-            epsilon = 1e-10
-        );
-        assert_relative_eq!(
-            ActivationFunction::ReLU.apply(x),
-            relu(x),
-            epsilon = 1e-10
-        );
-        assert_relative_eq!(
-            ActivationFunction::Linear.apply(x),
-            x,
-            epsilon = 1e-10
-        );
+        assert_relative_eq!(ActivationFunction::Tanh.apply(x), tanh(x), epsilon = 1e-10);
+        assert_relative_eq!(ActivationFunction::ReLU.apply(x), relu(x), epsilon = 1e-10);
+        assert_relative_eq!(ActivationFunction::Linear.apply(x), x, epsilon = 1e-10);
     }
 
     #[test]
