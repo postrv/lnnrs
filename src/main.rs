@@ -13,6 +13,9 @@
 //!
 //! # Test CfC network
 //! lnn cfc -u 32 -l 100
+//!
+//! # Train a CfC network on a waveform prediction task
+//! lnn train --model cfc --task sine --epochs 200 --lr 0.01 --seed 42 --units 32
 //! ```
 
 use clap::{Parser, Subcommand};
@@ -110,9 +113,9 @@ enum Commands {
         no_gate: bool,
     },
 
-    /// Run time-series prediction example
+    /// Run time-series prediction example (trains a CfC by default)
     TimeSeries {
-        /// Model type: ltc, cfc, or lnn
+        /// Model type: ltc, cfc, or lnn (only cfc supports training)
         #[arg(short, long, default_value = "cfc")]
         model: String,
 
@@ -123,6 +126,41 @@ enum Commands {
         /// Prediction task: sine, square, or sawtooth
         #[arg(short, long, default_value = "sine")]
         task: String,
+
+        /// Skip training and run the untrained forward pass (random weights)
+        #[arg(long)]
+        no_train: bool,
+    },
+
+    /// Train a model on a waveform prediction task using BPTT
+    Train {
+        /// Model type (only cfc is currently trainable)
+        #[arg(short, long, default_value = "cfc")]
+        model: String,
+
+        /// Prediction task: sine, square, or sawtooth
+        #[arg(short, long, default_value = "sine")]
+        task: String,
+
+        /// Number of training epochs
+        #[arg(short, long, default_value = "200")]
+        epochs: usize,
+
+        /// Learning rate (Adam)
+        #[arg(short, long, default_value = "0.01")]
+        lr: f64,
+
+        /// Seed for reproducible weight initialization
+        #[arg(short, long, default_value = "42")]
+        seed: u64,
+
+        /// Number of hidden units
+        #[arg(short = 'u', long, default_value = "32")]
+        units: usize,
+
+        /// Save the trained model as JSON to this path
+        #[arg(long)]
+        save: Option<String>,
     },
 }
 
@@ -177,8 +215,25 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             test_cfc_network(units, length, no_gate)?;
         }
 
-        Some(Commands::TimeSeries { model, units, task }) => {
-            run_time_series_example(&model, units, &task)?;
+        Some(Commands::TimeSeries {
+            model,
+            units,
+            task,
+            no_train,
+        }) => {
+            run_time_series_example(&model, units, &task, no_train)?;
+        }
+
+        Some(Commands::Train {
+            model,
+            task,
+            epochs,
+            lr,
+            seed,
+            units,
+            save,
+        }) => {
+            run_training(&model, &task, epochs, lr, seed, units, save.as_deref())?;
         }
 
         None => {
@@ -452,26 +507,11 @@ fn test_cfc_network(
     Ok(())
 }
 
-/// Runs a time-series prediction example.
-fn run_time_series_example(
-    model: &str,
-    units: usize,
-    task: &str,
-) -> std::result::Result<(), Box<dyn Error>> {
-    use cfc::CfcBuilder;
-    use ltc::LtcNetwork;
-
-    println!("\n========================================");
-    println!("   Time Series Prediction Example");
-    println!("========================================\n");
-
-    println!("Configuration:");
-    println!("  Model: {}", model);
-    println!("  Hidden units: {}", units);
-    println!("  Task: {} wave prediction", task);
-
-    // Generate target signal
-    let length = 200;
+/// Generates a waveform next-step prediction task.
+///
+/// Returns `(inputs, targets)` where `targets[i]` is the waveform value at step `i` and
+/// `inputs[i] = [target[i - 1], cos(t_i)]` (previous value plus a phase reference).
+fn generate_wave_task(task: &str, length: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
     let targets: Vec<f64> = (0..length)
         .map(|i| {
             let t = i as f64 * 0.05;
@@ -489,7 +529,6 @@ fn run_time_series_example(
         })
         .collect();
 
-    // Create input sequence (shifted target, simulating prediction task)
     let inputs: Vec<Vec<f64>> = (0..length)
         .map(|i| {
             let prev = if i > 0 { targets[i - 1] } else { 0.0 };
@@ -497,27 +536,12 @@ fn run_time_series_example(
         })
         .collect();
 
-    // Run with selected model
-    let outputs = match model.to_lowercase().as_str() {
-        "ltc" => {
-            let network = LtcNetwork::new(2, units, 1);
-            network.forward_sequence(&inputs)
-        }
-        "cfc" => {
-            let network = CfcBuilder::new(2, 1).hidden_units(units).build();
-            network.forward_sequence(&inputs)
-        }
-        _ => {
-            // Use classic LNN
-            let mut lnn = LiquidNeuralNetwork::new(units);
-            lnn.set_input_neurons(vec![0, 1]);
-            lnn.set_output_neurons(vec![units - 1]);
-            let converted_inputs: Vec<Vec<f64>> = inputs.clone();
-            lnn.run_simulation(1, converted_inputs)?
-        }
-    };
+    (inputs, targets)
+}
 
-    // Calculate MSE (just for demonstration, not actual training)
+/// Prints a sample-prediction table (every 20th step) and returns the MSE.
+fn report_predictions(outputs: &[Vec<f64>], targets: &[f64]) -> f64 {
+    let length = targets.len();
     let mse: f64 = outputs
         .iter()
         .zip(targets.iter())
@@ -542,8 +566,175 @@ fn run_time_series_example(
         );
     }
 
-    println!("\nNote: This is a forward pass demonstration. The network is not trained,");
-    println!("so predictions are based on random initial weights.");
+    mse
+}
+
+/// Trains a seeded [`TrainableCfc`] on a waveform task, logging the loss every
+/// `max(1, epochs / 10)` epochs. Returns the trained network and the final training loss.
+fn train_cfc_on_task(
+    inputs: &[Vec<f64>],
+    targets: &[f64],
+    units: usize,
+    epochs: usize,
+    lr: f64,
+    seed: u64,
+) -> (TrainableCfc, f64) {
+    let target_rows: Vec<Vec<f64>> = targets.iter().map(|&t| vec![t]).collect();
+
+    let mut net = TrainableCfcBuilder::new(2, units, 1)
+        .learning_rate(lr)
+        .truncation_length(inputs.len())
+        .seed(seed)
+        .build();
+
+    let log_every = std::cmp::max(1, epochs / 10);
+    let mut last_loss = f64::NAN;
+    for epoch in 1..=epochs {
+        last_loss = net.train_step(inputs, &target_rows);
+        if epoch % log_every == 0 || epoch == epochs {
+            println!("  epoch {:>5}: loss = {:.6}", epoch, last_loss);
+        }
+    }
+
+    (net, last_loss)
+}
+
+/// Trains a model on a waveform prediction task (the `train` subcommand).
+fn run_training(
+    model: &str,
+    task: &str,
+    epochs: usize,
+    lr: f64,
+    seed: u64,
+    units: usize,
+    save: Option<&str>,
+) -> std::result::Result<(), Box<dyn Error>> {
+    if model.to_lowercase() != "cfc" {
+        return Err(format!(
+            "unsupported model '{}': only 'cfc' is currently trainable",
+            model
+        )
+        .into());
+    }
+
+    println!("\n========================================");
+    println!("   CfC Training (BPTT + Adam)");
+    println!("========================================\n");
+
+    println!("Configuration:");
+    println!("  Model: {}", model);
+    println!("  Task: {} wave prediction", task);
+    println!("  Hidden units: {}", units);
+    println!("  Epochs: {}", epochs);
+    println!("  Learning rate: {}", lr);
+    println!("  Seed: {}", seed);
+
+    let length = 200;
+    let (inputs, targets) = generate_wave_task(task, length);
+    let target_rows: Vec<Vec<f64>> = targets.iter().map(|&t| vec![t]).collect();
+
+    // Untrained baseline (same seed / architecture, before any updates).
+    let baseline = TrainableCfcBuilder::new(2, units, 1).seed(seed).build();
+    let untrained_mse = baseline.loss(&inputs, &target_rows);
+    println!("\nUntrained MSE: {:.6}", untrained_mse);
+
+    println!("\nTraining:");
+    let start = std::time::Instant::now();
+    let (net, _) = train_cfc_on_task(&inputs, &targets, units, epochs, lr, seed);
+    let elapsed = start.elapsed();
+
+    let outputs = net.predict(&inputs);
+    let final_mse = report_predictions(&outputs, &targets);
+
+    println!("\n  Training time: {:?}", elapsed);
+    println!("  Final MSE: {:.6}", final_mse);
+    println!(
+        "  Improvement over untrained: {:.1}x",
+        untrained_mse / final_mse
+    );
+
+    if let Some(path) = save {
+        let json = serde_json::to_string_pretty(&net)?;
+        std::fs::write(path, json)?;
+        println!("  Saved trained model to '{}'", path);
+    }
+
+    Ok(())
+}
+
+/// Runs a time-series prediction example.
+///
+/// The CfC model is trained by default (BPTT + Adam, 200 epochs, lr 0.01, seed 42);
+/// `--no-train` restores the untrained forward pass. LTC and classic LNN models have no
+/// training path and always run untrained.
+fn run_time_series_example(
+    model: &str,
+    units: usize,
+    task: &str,
+    no_train: bool,
+) -> std::result::Result<(), Box<dyn Error>> {
+    use cfc::CfcBuilder;
+    use ltc::LtcNetwork;
+
+    println!("\n========================================");
+    println!("   Time Series Prediction Example");
+    println!("========================================\n");
+
+    let model_kind = model.to_lowercase();
+    let trained = model_kind == "cfc" && !no_train;
+
+    println!("Configuration:");
+    println!("  Model: {}", model);
+    println!("  Hidden units: {}", units);
+    println!("  Task: {} wave prediction", task);
+    println!(
+        "  Training: {}",
+        if trained { "enabled" } else { "disabled" }
+    );
+
+    let length = 200;
+    let (inputs, targets) = generate_wave_task(task, length);
+
+    // Run with selected model
+    let outputs = match model_kind.as_str() {
+        "cfc" if trained => {
+            let (epochs, lr, seed) = (200, 0.01, 42);
+            println!(
+                "\nTraining (epochs: {}, lr: {}, seed: {}):",
+                epochs, lr, seed
+            );
+            let (net, _) = train_cfc_on_task(&inputs, &targets, units, epochs, lr, seed);
+            net.predict(&inputs)
+        }
+        "cfc" => {
+            let network = CfcBuilder::new(2, 1).hidden_units(units).build();
+            network.forward_sequence(&inputs)
+        }
+        "ltc" => {
+            let network = LtcNetwork::new(2, units, 1);
+            network.forward_sequence(&inputs)
+        }
+        _ => {
+            // Use classic LNN
+            let mut lnn = LiquidNeuralNetwork::new(units);
+            lnn.set_input_neurons(vec![0, 1]);
+            lnn.set_output_neurons(vec![units - 1]);
+            let converted_inputs: Vec<Vec<f64>> = inputs.clone();
+            lnn.run_simulation(1, converted_inputs)?
+        }
+    };
+
+    report_predictions(&outputs, &targets);
+
+    if !trained {
+        println!("\nNote: This is a forward pass demonstration. The network is not trained,");
+        println!("so predictions are based on random initial weights.");
+        if model_kind == "cfc" {
+            println!("Drop --no-train to train the CfC before predicting.");
+        } else {
+            println!("Training is currently only supported for the cfc model.");
+        }
+    }
 
     Ok(())
 }

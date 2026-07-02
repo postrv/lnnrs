@@ -86,6 +86,40 @@ impl BackboneActivation {
             }
         }
     }
+
+    /// Returns the derivative `d apply(x) / dx` evaluated at the pre-activation `x`.
+    ///
+    /// This is required for backpropagation through the CfC backbone (see
+    /// [`crate::train_cfc`]). The closed forms are:
+    ///
+    /// * `Tanh`: `1 - tanh(x)^2`
+    /// * `ReLU`: `1` if `x > 0`, else `0` (subgradient `0` at the kink)
+    /// * `SiLU`: `sigmoid(x) * (1 + x * (1 - sigmoid(x)))`
+    /// * `GELU` (approx `x * sigmoid(1.702 x)`):
+    ///   `sigmoid(1.702 x) + 1.702 x * sigmoid(1.702 x) * (1 - sigmoid(1.702 x))`
+    pub fn derivative(&self, x: f64) -> f64 {
+        match self {
+            BackboneActivation::Tanh => {
+                let t = x.tanh();
+                1.0 - t * t
+            }
+            BackboneActivation::ReLU => {
+                if x > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            BackboneActivation::SiLU => {
+                let s = sigmoid(x);
+                s * (1.0 + x * (1.0 - s))
+            }
+            BackboneActivation::GELU => {
+                let s = sigmoid(1.702 * x);
+                s + 1.702 * x * s * (1.0 - s)
+            }
+        }
+    }
 }
 
 impl Default for CfcConfig {
@@ -606,6 +640,57 @@ mod tests {
         assert_eq!(BackboneActivation::ReLU.apply(1.0), 1.0);
         assert!(BackboneActivation::SiLU.apply(1.0) > 0.0);
         assert!(BackboneActivation::GELU.apply(1.0) > 0.0);
+    }
+
+    #[test]
+    fn test_backbone_activation_derivative_matches_finite_difference() {
+        // Every smooth activation's analytic derivative must match a central finite
+        // difference; ReLU is checked away from its kink.
+        let eps = 1e-6;
+        let activations = [
+            BackboneActivation::Tanh,
+            BackboneActivation::ReLU,
+            BackboneActivation::SiLU,
+            BackboneActivation::GELU,
+        ];
+        for act in activations {
+            for &x in &[-2.3, -1.0, -0.4, 0.4, 1.0, 2.3] {
+                let numeric = (act.apply(x + eps) - act.apply(x - eps)) / (2.0 * eps);
+                let analytic = act.derivative(x);
+                assert!(
+                    (numeric - analytic).abs() < 1e-5,
+                    "{:?} derivative mismatch at x={}: analytic={} numeric={}",
+                    act,
+                    x,
+                    analytic,
+                    numeric
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_backbone_activation_derivative_known_values() {
+        // Spot-check the closed forms the spec pins down.
+        assert_relative_eq!(
+            BackboneActivation::Tanh.derivative(0.0),
+            1.0,
+            epsilon = 1e-12
+        );
+        assert_eq!(BackboneActivation::ReLU.derivative(2.0), 1.0);
+        assert_eq!(BackboneActivation::ReLU.derivative(-2.0), 0.0);
+        // SiLU'(0) = sigmoid(0) * (1 + 0) = 0.5.
+        assert_relative_eq!(
+            BackboneActivation::SiLU.derivative(0.0),
+            0.5,
+            epsilon = 1e-12
+        );
+        // GELU'(0) = sigmoid(0) = 0.5.
+        assert_relative_eq!(
+            BackboneActivation::GELU.derivative(0.0),
+            0.5,
+            epsilon = 1e-12
+        );
     }
 
     #[test]

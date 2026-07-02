@@ -70,7 +70,9 @@ pub mod lnn;
 pub mod ltc;
 pub mod network_components;
 pub mod ode_solver;
+pub mod optim;
 pub mod output;
+pub mod train_cfc;
 pub mod training;
 
 /// Prelude module for convenient imports.
@@ -101,7 +103,11 @@ pub mod prelude {
         DormandPrince, EulerSolver, OdeSolver, OdeState, OdeSystem, RungeKutta4, SolverConfig,
     };
 
+    // Optimizers
+    pub use crate::optim::{clip_grad_norm, Adam, Optimizer, Sgd};
+
     // Training
+    pub use crate::train_cfc::{TrainableCfc, TrainableCfcBuilder};
     pub use crate::training::{
         mse_loss_with_grad, BpttConfig, TrainableDense, TrainableRnn, TrainableRnnBuilder,
         TrainableRnnCell,

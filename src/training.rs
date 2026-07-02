@@ -25,6 +25,7 @@
 
 use crate::activation::tanh;
 use crate::layers::DenseLayer;
+use crate::optim::{clip_grad_norm, Optimizer, Sgd};
 use ndarray::{Array1, Array2, ArrayView1};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -37,7 +38,13 @@ pub struct BpttConfig {
     pub learning_rate: f64,
     /// Truncation length (how many timesteps to backprop through)
     pub truncation_length: usize,
-    /// Gradient clipping threshold
+    /// Global-norm gradient-clipping threshold.
+    ///
+    /// When `Some(max_norm)`, all of a model's gradient tensors are rescaled jointly (see
+    /// [`clip_grad_norm`](crate::optim::clip_grad_norm)) so their combined L2 norm does not
+    /// exceed `max_norm`, applied once before the optimizer step. `None` disables clipping.
+    /// (This replaces the earlier per-element gradient clamping; the standalone
+    /// [`TrainableDense::update`] still clamps per element for backward compatibility.)
     pub gradient_clip: Option<f64>,
     /// L2 regularization coefficient
     pub l2_lambda: f64,
@@ -238,6 +245,17 @@ impl TrainableDense {
         self.grad_weights.fill(0.0);
         self.grad_bias.fill(0.0);
     }
+
+    /// Folds L2 regularization into the accumulated weight gradient
+    /// (`grad_weights += lambda * weights`); biases are left unregularized.
+    ///
+    /// Used by optimizer-driven training paths that clip and step outside of
+    /// [`Self::update`], so the L2 term is applied consistently before global-norm clipping.
+    pub fn fold_l2(&mut self, lambda: f64) {
+        if lambda != 0.0 {
+            self.grad_weights.scaled_add(lambda, &self.layer.weights);
+        }
+    }
 }
 
 /// A trainable simple RNN cell for demonstrating BPTT.
@@ -351,6 +369,9 @@ pub struct TrainableRnn {
     pub output: TrainableDense,
     /// Training configuration
     pub config: BpttConfig,
+    /// SGD+momentum optimizer (state is not serialized).
+    #[serde(skip)]
+    optimizer: Sgd,
     /// Cached states for backward pass
     #[serde(skip)]
     cached_states: Vec<Vec<f64>>,
@@ -388,10 +409,12 @@ impl TrainableRnn {
             seed,
             ..BpttConfig::default()
         };
+        let optimizer = Sgd::new(config.learning_rate, config.momentum);
         TrainableRnn {
             cell: TrainableRnnCell::with_rng(input_dim, hidden_dim, &mut rng),
             output: TrainableDense::with_rng(hidden_dim, output_dim, &mut rng),
             config,
+            optimizer,
             cached_states: Vec::new(),
             cached_pre_acts: Vec::new(),
             cached_inputs: Vec::new(),
@@ -492,9 +515,32 @@ impl TrainableRnn {
         // Backward pass
         self.backward(&grad_outputs);
 
-        // Update weights
-        self.cell.update(&self.config);
-        self.output.update(&self.config);
+        // Fold L2 regularization into weight gradients (matches the standalone update()).
+        let l2 = self.config.l2_lambda;
+        self.cell.w_in.fold_l2(l2);
+        self.cell.w_rec.fold_l2(l2);
+        self.output.fold_l2(l2);
+
+        // Global-norm gradient clipping across every tensor before the optimizer step.
+        if let Some(max_norm) = self.config.gradient_clip {
+            let mut grads: Vec<&mut [f64]> = vec![
+                self.cell.w_in.grad_weights.as_slice_mut().unwrap(),
+                self.cell.w_in.grad_bias.as_slice_mut().unwrap(),
+                self.cell.w_rec.grad_weights.as_slice_mut().unwrap(),
+                self.cell.w_rec.grad_bias.as_slice_mut().unwrap(),
+                self.output.grad_weights.as_slice_mut().unwrap(),
+                self.output.grad_bias.as_slice_mut().unwrap(),
+            ];
+            clip_grad_norm(&mut grads, max_norm);
+        }
+
+        // Update weights through the Optimizer trait (SGD + momentum by default).
+        self.optimizer.set_learning_rate(self.config.learning_rate);
+        self.optimizer.set_momentum(self.config.momentum);
+        let mut group = 0usize;
+        sgd_step_dense(&mut self.optimizer, &mut self.cell.w_in, &mut group);
+        sgd_step_dense(&mut self.optimizer, &mut self.cell.w_rec, &mut group);
+        sgd_step_dense(&mut self.optimizer, &mut self.output, &mut group);
 
         loss
     }
@@ -523,6 +569,27 @@ impl TrainableRnn {
     pub fn hidden_dim(&self) -> usize {
         self.cell.hidden_dim
     }
+}
+
+/// Applies one SGD step to a trainable dense layer's weight and bias tensors via the
+/// [`Optimizer`] trait, advancing the `param_group` counter for each tensor.
+fn sgd_step_dense(opt: &mut Sgd, dense: &mut TrainableDense, group: &mut usize) {
+    opt.step(
+        dense
+            .layer
+            .weights
+            .as_slice_mut()
+            .expect("contiguous weights"),
+        dense.grad_weights.as_slice().expect("contiguous grad"),
+        *group,
+    );
+    *group += 1;
+    opt.step(
+        dense.layer.bias.as_slice_mut().expect("contiguous bias"),
+        dense.grad_bias.as_slice().expect("contiguous grad"),
+        *group,
+    );
+    *group += 1;
 }
 
 /// Computes MSE loss and its gradient w.r.t. the predictions.
