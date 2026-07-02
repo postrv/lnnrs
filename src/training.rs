@@ -151,8 +151,8 @@ impl TrainableDense {
     pub fn forward(&self, input: &[f64]) -> Vec<f64> {
         let mut output = self.bias.clone();
         for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for j in 0..self.output_dim {
-                output[j] += self.weights[i][j] * inp;
+            for (out, &w) in output.iter_mut().zip(self.weights[i].iter()) {
+                *out += w * inp;
             }
         }
         output
@@ -181,9 +181,9 @@ impl TrainableDense {
 
         // Compute input gradient: dL/dx = grad_output @ W^T
         let mut grad_input = vec![0.0; self.input_dim];
-        for i in 0..self.input_dim {
+        for (i, grad_in) in grad_input.iter_mut().enumerate() {
             for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-                grad_input[i] += self.weights[i][j] * grad;
+                *grad_in += self.weights[i][j] * grad;
             }
         }
 
@@ -802,9 +802,9 @@ mod tests {
         layer.update(&config);
 
         // Weights should have changed but not by huge amounts due to clipping
-        for i in 0..2 {
-            for j in 0..2 {
-                let diff = (layer.weights[i][j] - original_weights[i][j]).abs();
+        for (row, orig_row) in layer.weights.iter().zip(original_weights.iter()) {
+            for (w, orig_w) in row.iter().zip(orig_row.iter()) {
+                let diff = (w - orig_w).abs();
                 assert!(
                     diff < 1.0,
                     "Weight change {} exceeds expected with clipping",

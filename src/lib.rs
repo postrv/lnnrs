@@ -58,9 +58,9 @@ pub mod prelude {
     pub use crate::error::{LnnError, Result};
     pub use crate::input::{read_input_from_csv, validate_inputs};
     pub use crate::lnn::{
-        LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate, NetworkStatistics,
+        LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate, NetworkStatistics, ReadoutConfig,
     };
-    pub use crate::network_components::{Neuron, NeuronDerivatives, NeuronEvent, Synapse};
+    pub use crate::network_components::{Neuron, NeuronDerivatives, Synapse, ThresholdAdaptation};
     pub use crate::output::{write_output_to_csv, write_output_with_headers};
 
     // LTC (Liquid Time-Constant)

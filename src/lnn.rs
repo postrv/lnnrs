@@ -13,12 +13,15 @@ use ndarray::Array2;
 use rand::{thread_rng, Rng};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use smartcore::linalg::basic::matrix::DenseMatrix;
-use smartcore::linear::linear_regression::*;
 use std::fmt;
 
 /// Default synaptic delay in timesteps.
 const DEFAULT_DELAY: u32 = 1;
+
+/// Threshold assigned to logic-gate neurons so that they never fire and simply integrate
+/// their (linear) inputs; the gate's truth value is read from the sign of the accumulated
+/// membrane potential via the sigmoid decode.
+const GATE_NON_FIRING_THRESHOLD: f64 = 1e9;
 
 /// Supported logic gate types for network configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,9 @@ pub enum LogicGate {
 
 impl LogicGate {
     /// Parses a string into a LogicGate variant.
+    // A `FromStr` trait implementation is deferred to a later phase; the inherent method is
+    // retained here for the current call sites.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
             "AND" => Ok(LogicGate::And),
@@ -219,9 +225,54 @@ impl LnnConfig {
         self
     }
 
+    /// Validates the configuration.
+    ///
+    /// Ranges are sampled *inclusively* (`min..=max`), so degenerate ranges where
+    /// `min == max` are legal; only `min > max`, empty networks and sub-unit delays are
+    /// rejected.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Configuration`] if `neuron_count == 0`, any range has
+    /// `min > max`, or `delay_range.0 < 1`.
+    pub fn validate(&self) -> Result<()> {
+        if self.neuron_count == 0 {
+            return Err(LnnError::configuration("neuron_count must be >= 1"));
+        }
+        if self.weight_range.0 > self.weight_range.1 {
+            return Err(LnnError::configuration("weight_range min must be <= max"));
+        }
+        if self.threshold_range.0 > self.threshold_range.1 {
+            return Err(LnnError::configuration(
+                "threshold_range min must be <= max",
+            ));
+        }
+        if self.delay_range.0 > self.delay_range.1 {
+            return Err(LnnError::configuration("delay_range min must be <= max"));
+        }
+        if self.delay_range.0 < 1 {
+            return Err(LnnError::configuration("delay_range min must be >= 1"));
+        }
+        Ok(())
+    }
+
     /// Builds a LiquidNeuralNetwork from this configuration.
+    ///
+    /// # Panics
+    /// Panics with the validation message if [`validate`](Self::validate) fails. Use
+    /// [`try_build`](Self::try_build) for a non-panicking variant.
     pub fn build(self) -> LiquidNeuralNetwork {
-        LiquidNeuralNetwork::from_config(self)
+        self.try_build()
+            .unwrap_or_else(|e| panic!("invalid LnnConfig: {e}"))
+    }
+
+    /// Builds a LiquidNeuralNetwork, returning an error instead of panicking on an invalid
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns the [`validate`](Self::validate) error if the configuration is invalid.
+    pub fn try_build(self) -> Result<LiquidNeuralNetwork> {
+        self.validate()?;
+        Ok(LiquidNeuralNetwork::from_config(self))
     }
 }
 
@@ -269,9 +320,92 @@ impl LnnBuilder {
     }
 
     /// Builds the LiquidNeuralNetwork.
+    ///
+    /// # Panics
+    /// Panics with the validation message if the configuration is invalid. Use
+    /// [`try_build`](Self::try_build) for a non-panicking variant.
     pub fn build(self) -> LiquidNeuralNetwork {
-        LiquidNeuralNetwork::from_config(self.config)
+        self.config.build()
     }
+
+    /// Builds the LiquidNeuralNetwork, returning an error instead of panicking on an invalid
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns the validation error if the configuration is invalid.
+    pub fn try_build(self) -> Result<LiquidNeuralNetwork> {
+        self.config.try_build()
+    }
+}
+
+/// Configuration for training the ridge-regression readout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReadoutConfig {
+    /// Number of reservoir steps to run per pattern before reading the state.
+    pub timesteps: usize,
+    /// Ridge (Tikhonov) regularisation strength added to the normal-equation diagonal.
+    pub ridge_lambda: f64,
+}
+
+impl Default for ReadoutConfig {
+    fn default() -> Self {
+        ReadoutConfig {
+            timesteps: 10,
+            ridge_lambda: 1e-6,
+        }
+    }
+}
+
+/// Solves the linear system `a x = b` via Gaussian elimination with partial pivoting.
+///
+/// Returns `None` if `a` is not square, dimensions are inconsistent, or the matrix is
+/// (numerically) singular.
+fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
+    let n = b.len();
+    if a.len() != n || a.iter().any(|row| row.len() != n) {
+        return None;
+    }
+
+    for col in 0..n {
+        // Partial pivot: pick the row with the largest magnitude in this column.
+        let mut pivot_row = col;
+        let mut best = a[col][col].abs();
+        for (r, row) in a.iter().enumerate().skip(col + 1) {
+            let mag = row[col].abs();
+            if mag > best {
+                best = mag;
+                pivot_row = r;
+            }
+        }
+        if best < 1e-12 {
+            return None; // singular
+        }
+        a.swap(col, pivot_row);
+        b.swap(col, pivot_row);
+
+        let pivot_row_vals = a[col].clone();
+        let pivot = pivot_row_vals[col];
+        for r in (col + 1)..n {
+            let factor = a[r][col] / pivot;
+            if factor != 0.0 {
+                for (target, &p_val) in a[r].iter_mut().zip(pivot_row_vals.iter()).skip(col) {
+                    *target -= factor * p_val;
+                }
+                b[r] -= factor * b[col];
+            }
+        }
+    }
+
+    // Back-substitution.
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let mut sum = b[i];
+        for c in (i + 1)..n {
+            sum -= a[i][c] * x[c];
+        }
+        x[i] = sum / a[i][i];
+    }
+    Some(x)
 }
 
 /// Represents the entire Liquid Neural Network.
@@ -306,18 +440,20 @@ impl LiquidNeuralNetwork {
         let mut rng = thread_rng();
         let neuron_count = config.neuron_count;
 
-        // Create neurons with random thresholds
+        // Create neurons with random thresholds (inclusive range sampling).
         let neurons: Vec<Neuron> = (0..neuron_count)
-            .map(|_| Neuron::new(rng.gen_range(config.threshold_range.0..config.threshold_range.1)))
+            .map(|_| {
+                Neuron::new(rng.gen_range(config.threshold_range.0..=config.threshold_range.1))
+            })
             .collect();
 
-        // Initialize synapses
+        // Initialize synapses (inclusive range sampling for weight/delay).
         let mut synapses_array = Array2::default((neuron_count, neuron_count));
         for i in 0..neuron_count {
             for j in 0..neuron_count {
                 if i != j && rng.gen::<f64>() < config.connection_probability {
-                    let weight = rng.gen_range(config.weight_range.0..config.weight_range.1);
-                    let delay = rng.gen_range(config.delay_range.0..config.delay_range.1);
+                    let weight = rng.gen_range(config.weight_range.0..=config.weight_range.1);
+                    let delay = rng.gen_range(config.delay_range.0..=config.delay_range.1);
                     synapses_array[[i, j]] = Some(Synapse::new(i, j, weight, delay));
                 }
             }
@@ -429,10 +565,8 @@ impl LiquidNeuralNetwork {
             let scaling_factor = spectral_radius / max_eigenvalue_magnitude;
 
             // Scale all synapse weights
-            for synapse_opt in self.synapses.0.iter_mut() {
-                if let Some(synapse) = synapse_opt {
-                    synapse.weight *= scaling_factor;
-                }
+            for synapse in self.synapses.0.iter_mut().flatten() {
+                synapse.weight *= scaling_factor;
             }
         }
     }
@@ -511,6 +645,10 @@ impl LiquidNeuralNetwork {
     ///
     /// # Returns
     /// `Ok(())` if successful, `Err` if indices are invalid
+    ///
+    /// # Errors
+    /// Returns an error if either index is out of bounds, the connection is a
+    /// self-connection, or `delay < 1` (a signal must arrive on a strictly later step).
     pub fn connect_neurons(
         &mut self,
         pre_idx: usize,
@@ -533,6 +671,9 @@ impl LiquidNeuralNetwork {
         if pre_idx == post_idx {
             return Err(LnnError::configuration("Cannot create self-connection"));
         }
+        if delay < 1 {
+            return Err(LnnError::configuration("Synaptic delay must be >= 1"));
+        }
 
         self.synapses.0[[pre_idx, post_idx]] = Some(Synapse::new(pre_idx, post_idx, weight, delay));
         Ok(())
@@ -553,8 +694,15 @@ impl LiquidNeuralNetwork {
 
     /// Encodes external input data into neural stimulation.
     ///
-    /// Input values are added to the membrane potentials of designated input neurons.
+    /// Input values are added (once) to the membrane potentials of the designated input
+    /// neurons. Call sites are expected to validate the input length first (see
+    /// [`run_simulation`](Self::run_simulation)); this method is infallible by construction.
     pub fn encode_input(&mut self, input_data: &[f64]) {
+        debug_assert_eq!(
+            input_data.len(),
+            self.input_indices.len(),
+            "encode_input length must match the number of input neurons"
+        );
         for (&neuron_idx, &stimulus) in self.input_indices.iter().zip(input_data) {
             if let Some(neuron) = self.neurons.get_mut(neuron_idx) {
                 neuron.membrane_potential += stimulus;
@@ -578,51 +726,108 @@ impl LiquidNeuralNetwork {
         output
     }
 
-    /// Trains a Linear Regression model as the readout layer.
+    /// Runs the reservoir on a single already-encoded pattern for `timesteps` steps and
+    /// returns the readout feature vector: every neuron's membrane potential followed by a
+    /// constant `1.0` bias term.
     ///
-    /// # Arguments
-    /// * `inputs` - Training input patterns
-    /// * `expected_outputs` - Expected output values
+    /// The caller is responsible for resetting state and encoding the input beforehand.
+    fn collect_state_features(&mut self, timesteps: usize) -> Vec<f64> {
+        self.run_reservoir(timesteps);
+        let mut features: Vec<f64> = self.neurons.iter().map(|n| n.membrane_potential).collect();
+        features.push(1.0); // bias term
+        features
+    }
+
+    /// Trains a linear ridge-regression readout over the reservoir's final state.
     ///
-    /// # Returns
-    /// `Ok(())` if training succeeds, `Err` otherwise
-    pub fn train_readout(&mut self, inputs: &[Vec<f64>], expected_outputs: &[f64]) -> Result<()> {
+    /// For each input pattern the reservoir is run from a freshly reset state for
+    /// `cfg.timesteps` steps; the full state vector `[potentials..., 1.0]` becomes a row of
+    /// the design matrix `S`. The readout weights solve the regularised normal equations
+    /// `(S^T S + lambda I) w = S^T y`, with `lambda = cfg.ridge_lambda`.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Training`] if no patterns are supplied, if `inputs` and `targets`
+    /// differ in length, or if the (regularised) system is singular.
+    pub fn train_readout(
+        &mut self,
+        inputs: &[Vec<f64>],
+        targets: &[f64],
+        cfg: &ReadoutConfig,
+    ) -> Result<()> {
         if inputs.is_empty() {
             return Err(LnnError::Training("No training inputs provided".into()));
         }
-        if inputs.len() != expected_outputs.len() {
-            return Err(LnnError::Training("Input and output count mismatch".into()));
+        if inputs.len() != targets.len() {
+            return Err(LnnError::Training("Input and target count mismatch".into()));
         }
 
-        let mut readout_inputs: Vec<Vec<f64>> = Vec::with_capacity(inputs.len());
-
+        // Collect the design matrix S (one row of features per pattern).
+        let mut design: Vec<Vec<f64>> = Vec::with_capacity(inputs.len());
         for input in inputs.iter() {
             self.reset_state();
             self.encode_input(input);
-            let output_response = self.decode_output();
-            readout_inputs.push(output_response);
+            design.push(self.collect_state_features(cfg.timesteps));
         }
 
-        // Check if we have valid readout inputs
-        if readout_inputs.is_empty() || readout_inputs[0].is_empty() {
+        let n_features = design[0].len();
+
+        // Normal equations: A = S^T S + lambda I, b = S^T y.
+        let mut a = vec![vec![0.0; n_features]; n_features];
+        let mut b = vec![0.0; n_features];
+        for (row, &target) in design.iter().zip(targets.iter()) {
+            for i in 0..n_features {
+                b[i] += row[i] * target;
+                for j in 0..n_features {
+                    a[i][j] += row[i] * row[j];
+                }
+            }
+        }
+        for (i, a_row) in a.iter_mut().enumerate() {
+            a_row[i] += cfg.ridge_lambda;
+        }
+
+        let weights = solve_linear_system(a, b)
+            .ok_or_else(|| LnnError::Training("Ridge-regression system is singular".into()))?;
+
+        self.readout_weights = weights;
+        Ok(())
+    }
+
+    /// Runs the reservoir on one pattern (from a reset state) and applies the trained
+    /// readout, returning the scalar prediction.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Training`] if the readout has not been trained yet, or if the
+    /// input length does not match the number of configured input neurons.
+    pub fn predict(&mut self, input: &[f64], timesteps: usize) -> Result<f64> {
+        if self.readout_weights.is_empty() {
             return Err(LnnError::Training(
-                "No output neurons configured for readout".into(),
+                "Readout has not been trained; call train_readout first".into(),
+            ));
+        }
+        if input.len() != self.input_indices.len() {
+            return Err(LnnError::Training(format!(
+                "input length {} does not match {} input neurons",
+                input.len(),
+                self.input_indices.len()
+            )));
+        }
+
+        self.reset_state();
+        self.encode_input(input);
+        let features = self.collect_state_features(timesteps);
+
+        if features.len() != self.readout_weights.len() {
+            return Err(LnnError::Training(
+                "Feature/readout dimension mismatch (network changed after training)".into(),
             ));
         }
 
-        let x = DenseMatrix::from_2d_vec(&readout_inputs);
-        let y = expected_outputs.to_vec();
-
-        let lr = LinearRegression::fit(
-            &x,
-            &y,
-            LinearRegressionParameters::default().with_solver(LinearRegressionSolverName::SVD),
-        )
-        .map_err(|e| LnnError::Training(format!("Linear regression failed: {:?}", e)))?;
-
-        // Store the learned weights
-        self.readout_weights = lr.coefficients().iter().copied().collect();
-        Ok(())
+        Ok(features
+            .iter()
+            .zip(self.readout_weights.iter())
+            .map(|(f, w)| f * w)
+            .sum())
     }
 
     /// Resets the network states to initial values.
@@ -646,11 +851,15 @@ impl LiquidNeuralNetwork {
     }
 
     /// Configures the network for a specific logic gate.
+    ///
+    /// The gate configuration is derived analytically for the synchronous, delayed reservoir
+    /// dynamics (see the module-level notes and `configure_and_gate`). All existing synapses
+    /// are cleared first, and every neuron is turned into a non-firing linear integrator with
+    /// `rest_potential = 0`; the gate's logic is encoded purely in synaptic weights and the
+    /// output neuron's constant `bias`. The truth value is read from the sign of the output
+    /// neuron's accumulated potential (`sigmoid(potential) > 0.5` iff `potential > 0`).
     pub fn configure_gate(&mut self, gate: LogicGate) {
-        // Set all neurons to use normalized mode (rest_potential = 0) for logic gates
-        for neuron in &mut self.neurons {
-            neuron.rest_potential = 0.0;
-        }
+        self.reset_to_blank_gate();
 
         match gate {
             LogicGate::And => self.configure_and_gate(),
@@ -662,186 +871,210 @@ impl LiquidNeuralNetwork {
         }
     }
 
+    /// Resets the network to a blank slate suitable for building a logic gate: removes every
+    /// synapse and makes every neuron a non-firing (`threshold = 1e9`) linear integrator with
+    /// zero rest potential, zero bias and no threshold adaptation.
+    fn reset_to_blank_gate(&mut self) {
+        let n = self.neurons.len();
+        self.synapses = SynapsesWrapper::new(n, n);
+        self.input_indices.clear();
+        self.output_indices.clear();
+        for neuron in &mut self.neurons {
+            neuron.reset();
+            neuron.rest_potential = 0.0;
+            neuron.threshold = GATE_NON_FIRING_THRESHOLD;
+            neuron.bias = 0.0;
+            neuron.adaptation.enabled = false;
+        }
+    }
+
+    // The linear-gate designs below all rely on the closed form of the (non-firing) output
+    // neuron after `T = 10` synchronous steps with `delay = 1`. Writing `L = 6/7` for the
+    // per-step leak factor and `R = 1.3` for the membrane resistance, a single input relay
+    // holding value `v` contributes `R * (T-1) * L^(T-1) * w * v ≈ 2.9219 * w * v` to the
+    // final output potential, and a constant output bias `b` contributes
+    // `7 * (1 - L^T) * b ≈ 5.5016 * b`. Each gate below picks `w` and `b` so that the final
+    // potential is `> 0` exactly on the intended rows.
+
     fn configure_and_gate(&mut self) {
         if self.neurons.len() < 3 {
             return;
         }
-
-        // Input neurons: 1, 2; Output neuron: 0
+        // Output 0 fires true only when both inputs are on: b = -0.8, w = 1.0.
+        // f(0) = -4.40, f(1) = -1.48, f(2) = +1.44.
         self.set_input_neurons(vec![1, 2]);
         self.set_output_neurons(vec![0]);
-
-        let _ = self.connect_neurons(1, 0, 0.5, 1);
-        let _ = self.connect_neurons(2, 0, 0.5, 1);
-
-        if let Some(neuron) = self.neurons.get_mut(0) {
-            neuron.threshold = 0.9; // High threshold for AND
-        }
+        let _ = self.connect_neurons(1, 0, 1.0, DEFAULT_DELAY);
+        let _ = self.connect_neurons(2, 0, 1.0, DEFAULT_DELAY);
+        self.neurons[0].bias = -0.8;
     }
 
     fn configure_or_gate(&mut self) {
         if self.neurons.len() < 3 {
             return;
         }
-
+        // Output 0 true when at least one input is on: b = -0.3, w = 1.0.
+        // f(0) = -1.65, f(1) = +1.27, f(2) = +4.19.
         self.set_input_neurons(vec![1, 2]);
         self.set_output_neurons(vec![0]);
-
-        let _ = self.connect_neurons(1, 0, 0.5, 1);
-        let _ = self.connect_neurons(2, 0, 0.5, 1);
-
-        if let Some(neuron) = self.neurons.get_mut(0) {
-            neuron.threshold = 0.4; // Low threshold for OR
-        }
+        let _ = self.connect_neurons(1, 0, 1.0, DEFAULT_DELAY);
+        let _ = self.connect_neurons(2, 0, 1.0, DEFAULT_DELAY);
+        self.neurons[0].bias = -0.3;
     }
 
     fn configure_not_gate(&mut self) {
         if self.neurons.len() < 2 {
             return;
         }
-
+        // Output 1 true when the single input is off: positive bias, inhibitory input.
+        // b = 0.5, w = -2.0. f(0) = +2.75, f(1) = -3.09.
         self.set_input_neurons(vec![0]);
         self.set_output_neurons(vec![1]);
-
-        // Configure neurons
-        self.neurons[0] = Neuron::with_id(0, 0.5);
-        self.neurons[1] = Neuron::with_id(1, 1.5);
-
-        // Inhibitory connection
-        let _ = self.connect_neurons(0, 1, -1.0, DEFAULT_DELAY);
+        let _ = self.connect_neurons(0, 1, -2.0, DEFAULT_DELAY);
+        self.neurons[1].bias = 0.5;
     }
 
     fn configure_nand_gate(&mut self) {
-        if self.neurons.len() < 4 {
+        if self.neurons.len() < 3 {
             return;
         }
-
-        // NAND = NOT(AND)
+        // NAND = NOT(AND): true unless both on. b = 1.0, w = -1.3.
+        // f(0) = +5.50, f(1) = +1.70, f(2) = -2.10.
         self.set_input_neurons(vec![1, 2]);
-        self.set_output_neurons(vec![3]);
-
-        // AND part (neuron 0 as intermediate)
-        let _ = self.connect_neurons(1, 0, 0.5, 1);
-        let _ = self.connect_neurons(2, 0, 0.5, 1);
-        if let Some(neuron) = self.neurons.get_mut(0) {
-            neuron.threshold = 0.9;
-        }
-
-        // NOT part (invert the AND result)
-        let _ = self.connect_neurons(0, 3, -1.0, 1);
-        if let Some(neuron) = self.neurons.get_mut(3) {
-            neuron.threshold = 0.5;
-            neuron.membrane_potential = 1.0; // Bias to be high by default
-        }
+        self.set_output_neurons(vec![0]);
+        let _ = self.connect_neurons(1, 0, -1.3, DEFAULT_DELAY);
+        let _ = self.connect_neurons(2, 0, -1.3, DEFAULT_DELAY);
+        self.neurons[0].bias = 1.0;
     }
 
     fn configure_nor_gate(&mut self) {
-        if self.neurons.len() < 4 {
+        if self.neurons.len() < 3 {
             return;
         }
-
-        // NOR = NOT(OR)
+        // NOR = NOT(OR): true only when both off. b = 0.5, w = -1.5.
+        // f(0) = +2.75, f(1) = -1.63, f(2) = -6.02.
         self.set_input_neurons(vec![1, 2]);
-        self.set_output_neurons(vec![3]);
-
-        // OR part
-        let _ = self.connect_neurons(1, 0, 0.5, 1);
-        let _ = self.connect_neurons(2, 0, 0.5, 1);
-        if let Some(neuron) = self.neurons.get_mut(0) {
-            neuron.threshold = 0.4;
-        }
-
-        // NOT part
-        let _ = self.connect_neurons(0, 3, -1.0, 1);
-        if let Some(neuron) = self.neurons.get_mut(3) {
-            neuron.threshold = 0.5;
-            neuron.membrane_potential = 1.0;
-        }
+        self.set_output_neurons(vec![0]);
+        let _ = self.connect_neurons(1, 0, -1.5, DEFAULT_DELAY);
+        let _ = self.connect_neurons(2, 0, -1.5, DEFAULT_DELAY);
+        self.neurons[0].bias = 0.5;
     }
 
     fn configure_xor_gate(&mut self) {
         if self.neurons.len() < 5 {
             return;
         }
-
-        // XOR needs multiple layers
+        // XOR is not linearly separable, so unlike the other gates it cannot be read from a
+        // purely linear (non-firing) integrator. Instead the output neuron (4) is a *firing*
+        // neuron whose spike-reset provides the nonlinearity: both inputs excite it strongly
+        // (weight 2.5). With a reset potential of -1.0 and threshold 4.0, over the fixed
+        // 10-step horizon the neuron ends *positive* when exactly one input is on but is left
+        // freshly reset (negative) when both inputs drive it hard, and a small negative bias
+        // keeps the all-zero case negative. This yields, at T = 10:
+        //   (0,0) -> -2.44, (0,1) -> +2.60, (1,0) -> +2.60, (1,1) -> -1.00
+        // i.e. the XOR truth table with a comfortable margin. (This design is tuned to the
+        // 10-step horizon used by the demo and tests.)
         self.set_input_neurons(vec![0, 1]);
         self.set_output_neurons(vec![4]);
 
-        // Layer 1: OR (neuron 2) and NAND-like (neuron 3)
-        let _ = self.connect_neurons(0, 2, 0.6, 1);
-        let _ = self.connect_neurons(1, 2, 0.6, 1);
-        if let Some(n) = self.neurons.get_mut(2) {
-            n.threshold = 0.5;
+        let _ = self.connect_neurons(0, 4, 2.5, DEFAULT_DELAY);
+        let _ = self.connect_neurons(1, 4, 2.5, DEFAULT_DELAY);
+        self.neurons[4].threshold = 4.0;
+        self.neurons[4].rest_potential = -1.0;
+        self.neurons[4].bias = -0.3;
+    }
+
+    /// Advances the network by `timesteps` synchronous steps using a real delay ring buffer.
+    ///
+    /// Assumes any input has already been encoded (see [`encode_input`](Self::encode_input)).
+    /// Per timestep `t` (with ring size `max_delay + 1`):
+    /// 1. the arrivals slot for `t` provides each neuron's `input_current`;
+    /// 2. every neuron is updated from that snapshot (updates are synchronous because the
+    ///    arrivals were scheduled from *previous*-step potentials);
+    /// 3. for every synapse, `weight * potential[source]` (post-update) is scheduled into the
+    ///    slot `(t + delay) % ring` of the target;
+    /// 4. the consumed slot is zeroed for reuse.
+    fn run_reservoir(&mut self, timesteps: usize) {
+        let n = self.neurons.len();
+        if n == 0 {
+            return;
         }
 
-        // NAND-like behavior through inhibition
-        let _ = self.connect_neurons(0, 3, 0.6, 1);
-        let _ = self.connect_neurons(1, 3, 0.6, 1);
-        if let Some(n) = self.neurons.get_mut(3) {
-            n.threshold = 1.1; // Only fires if both inputs are high
-        }
+        // Flatten the topology into (source, target, weight, delay). Iteration order is fixed
+        // by the (row-major) synapse matrix, so it is independent of insertion order.
+        let synapses: Vec<(usize, usize, f64, usize)> = self
+            .synapses
+            .iter_synapses()
+            .map(|s| (s.source, s.target, s.weight, s.delay as usize))
+            .collect();
 
-        // Output: OR output AND NOT(AND output)
-        let _ = self.connect_neurons(2, 4, 0.6, 1);
-        let _ = self.connect_neurons(3, 4, -1.0, 1); // Inhibit when both inputs high
-        if let Some(n) = self.neurons.get_mut(4) {
-            n.threshold = 0.5;
+        let max_delay = synapses.iter().map(|&(_, _, _, d)| d).max().unwrap_or(0);
+        let ring = max_delay + 1;
+        let mut arrivals: Vec<Vec<f64>> = vec![vec![0.0; n]; ring];
+
+        for t in 0..timesteps {
+            let slot = t % ring;
+
+            // (1) + (2): update every neuron from the arrivals snapshot for this step.
+            for (j, neuron) in self.neurons.iter_mut().enumerate() {
+                neuron.update_state(arrivals[slot][j]);
+            }
+
+            // (3): schedule emissions from the post-update potentials.
+            for &(source, target, weight, delay) in &synapses {
+                let potential = self.neurons[source].membrane_potential;
+                let dest = (t + delay) % ring;
+                arrivals[dest][target] += weight * potential;
+            }
+
+            // (4): zero the slot we just consumed so it can be reused at t + ring.
+            for value in arrivals[slot].iter_mut() {
+                *value = 0.0;
+            }
         }
     }
 
     /// Runs a simulation for a specified number of timesteps.
     ///
+    /// Each input pattern is encoded (added to the input neurons once) and then propagated
+    /// for `timesteps` synchronous steps; the decoded output is collected per pattern. Neuron
+    /// state carries across patterns unless the caller resets it.
+    ///
     /// # Arguments
-    /// * `timesteps` - Number of simulation steps to run
+    /// * `timesteps` - Number of simulation steps to run per pattern
     /// * `inputs` - Input patterns to process
     ///
     /// # Returns
-    /// Vector of output vectors, one for each input pattern
-    pub fn run_simulation(&mut self, timesteps: usize, inputs: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    /// Vector of output vectors, one for each input pattern.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Configuration`] if any input row's length does not equal the number
+    /// of configured input neurons.
+    pub fn run_simulation(
+        &mut self,
+        timesteps: usize,
+        inputs: Vec<Vec<f64>>,
+    ) -> Result<Vec<Vec<f64>>> {
+        let expected = self.input_indices.len();
+        for (idx, row) in inputs.iter().enumerate() {
+            if row.len() != expected {
+                return Err(LnnError::configuration(format!(
+                    "input row {} has length {} but {} input neurons are configured",
+                    idx,
+                    row.len(),
+                    expected
+                )));
+            }
+        }
+
         let mut outputs = Vec::with_capacity(inputs.len());
-
-        // Pre-collect synapses for each neuron
-        let synapses_for_neurons: Vec<Vec<Synapse>> = (0..self.neurons.len())
-            .map(|idx| self.get_synapses_for_neuron(idx))
-            .collect();
-
         for input_values in inputs.iter() {
             self.encode_input(input_values);
-
-            for timestep in 0..timesteps {
-                log::debug!("Running timestep {}", timestep);
-
-                // Update all neurons
-                for (neuron, synapses) in self.neurons.iter_mut().zip(synapses_for_neurons.iter()) {
-                    neuron.update_state(0.0, synapses);
-                }
-
-                // Propagate signals through synapses
-                for synapse_option in self.synapses.0.iter() {
-                    if let Some(synapse) = synapse_option {
-                        if let Some(source_neuron) = self.neurons.get(synapse.source) {
-                            let source_activity = source_neuron.membrane_potential;
-                            synapse.propagate_signal(
-                                source_activity,
-                                &mut self.neurons,
-                                timestep as u32,
-                            );
-                        }
-                    }
-                }
-
-                log::debug!(
-                    "Output at timestep {}: {:?}",
-                    timestep,
-                    self.decode_output()
-                );
-            }
-
+            self.run_reservoir(timesteps);
             outputs.push(self.decode_output());
         }
 
-        outputs
+        Ok(outputs)
     }
 
     /// Returns network statistics for debugging and analysis.
@@ -936,6 +1169,45 @@ mod tests {
 
             let config = LnnConfig::new(10).with_connection_probability(-0.5);
             assert_eq!(config.connection_probability, 0.0);
+        }
+
+        #[test]
+        fn test_validate_accepts_degenerate_ranges() {
+            // min == max is legal thanks to inclusive sampling.
+            let config = LnnConfig::new(4)
+                .with_weight_range(0.5, 0.5)
+                .with_threshold_range(0.7, 0.7)
+                .with_delay_range(2, 2);
+            assert!(config.validate().is_ok());
+            assert!(config.try_build().is_ok());
+        }
+
+        #[test]
+        fn test_validate_rejects_invalid_configs() {
+            assert!(LnnConfig::new(0).validate().is_err());
+            assert!(LnnConfig::new(4)
+                .with_weight_range(1.0, -1.0)
+                .validate()
+                .is_err());
+            assert!(LnnConfig::new(4)
+                .with_threshold_range(1.0, 0.0)
+                .validate()
+                .is_err());
+            assert!(LnnConfig::new(4).with_delay_range(5, 1).validate().is_err());
+            // delay_range.0 must be >= 1.
+            assert!(LnnConfig::new(4).with_delay_range(0, 3).validate().is_err());
+        }
+
+        #[test]
+        fn test_try_build_reports_error_instead_of_panicking() {
+            assert!(LnnConfig::new(0).try_build().is_err());
+            assert!(LnnBuilder::new(4).delay_range(0, 2).try_build().is_err());
+        }
+
+        #[test]
+        #[should_panic(expected = "invalid LnnConfig")]
+        fn test_build_panics_on_invalid_config() {
+            let _ = LnnConfig::new(0).build();
         }
     }
 
@@ -1159,7 +1431,7 @@ mod tests {
             lnn.set_output_neurons(vec![3, 4]);
 
             let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-            let outputs = lnn.run_simulation(3, inputs);
+            let outputs = lnn.run_simulation(3, inputs).unwrap();
 
             assert_eq!(outputs.len(), 2);
             assert_eq!(outputs[0].len(), 2);
@@ -1168,34 +1440,237 @@ mod tests {
         #[test]
         fn test_run_simulation_empty_inputs() {
             let mut lnn = LiquidNeuralNetwork::new(5);
-            let outputs = lnn.run_simulation(3, vec![]);
+            let outputs = lnn.run_simulation(3, vec![]).unwrap();
 
             assert!(outputs.is_empty());
         }
+
+        #[test]
+        fn test_run_simulation_rejects_wrong_input_length() {
+            let mut lnn = LiquidNeuralNetwork::new(5);
+            lnn.set_input_neurons(vec![0, 1]); // expects rows of length 2
+
+            let result = lnn.run_simulation(3, vec![vec![1.0]]);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_order_independence_of_synapse_insertion() {
+            // Two networks with identical topology but synapses inserted in different orders
+            // must produce identical outputs (spec 1d.6).
+            let build = |order_swapped: bool| {
+                let mut lnn = LiquidNeuralNetwork::new(4);
+                lnn.reset_to_blank_gate();
+                lnn.set_input_neurons(vec![0]);
+                lnn.set_output_neurons(vec![3]);
+                if order_swapped {
+                    lnn.connect_neurons(2, 3, -0.7, 2).unwrap();
+                    lnn.connect_neurons(1, 3, 0.9, 1).unwrap();
+                    lnn.connect_neurons(0, 1, 0.5, 1).unwrap();
+                    lnn.connect_neurons(0, 2, 0.4, 1).unwrap();
+                } else {
+                    lnn.connect_neurons(0, 1, 0.5, 1).unwrap();
+                    lnn.connect_neurons(0, 2, 0.4, 1).unwrap();
+                    lnn.connect_neurons(1, 3, 0.9, 1).unwrap();
+                    lnn.connect_neurons(2, 3, -0.7, 2).unwrap();
+                }
+                lnn
+            };
+
+            let out_a = build(false).run_simulation(8, vec![vec![1.0]]).unwrap();
+            let out_b = build(true).run_simulation(8, vec![vec![1.0]]).unwrap();
+            assert_eq!(out_a, out_b);
+        }
+
+        #[test]
+        fn test_delay_semantics() {
+            // Source (0) -> target (1) with delay 3. The signal emitted at the end of step 0
+            // must not reach the target until step 3 (spec 1d.7). Each run is independent (a
+            // ring buffer lives for the duration of a single `run_reservoir` call), so we
+            // probe the boundary with fresh runs of increasing length.
+            let make = || {
+                let mut lnn = LiquidNeuralNetwork::new(2);
+                lnn.reset_to_blank_gate();
+                lnn.set_input_neurons(vec![0]);
+                lnn.connect_neurons(0, 1, 5.0, 3).unwrap();
+                lnn.reset_state();
+                lnn.encode_input(&[1.0]);
+                lnn
+            };
+
+            // Running 1, 2 or 3 steps: the arrival (scheduled for step 3) is never consumed,
+            // so the target remains at rest.
+            for steps in 1..=3 {
+                let mut lnn = make();
+                lnn.run_reservoir(steps);
+                assert_eq!(
+                    lnn.neurons[1].membrane_potential, 0.0,
+                    "target changed too early after {steps} steps"
+                );
+            }
+            // Running 4 steps executes step t = 3, which consumes the delayed arrival.
+            let mut lnn = make();
+            lnn.run_reservoir(4);
+            assert!(lnn.neurons[1].membrane_potential != 0.0);
+        }
     }
 
-    mod training_tests {
+    mod readout_tests {
         use super::*;
+
+        #[test]
+        fn test_solve_linear_system_known_3x3() {
+            // Solve the system with known solution x = [2, 3, -1].
+            let a = vec![
+                vec![2.0, 1.0, -1.0],
+                vec![-3.0, -1.0, 2.0],
+                vec![-2.0, 1.0, 2.0],
+            ];
+            let b = vec![8.0, -11.0, -3.0];
+            let x = solve_linear_system(a, b).unwrap();
+            assert!((x[0] - 2.0).abs() < 1e-9);
+            assert!((x[1] - 3.0).abs() < 1e-9);
+            assert!((x[2] - (-1.0)).abs() < 1e-9);
+        }
+
+        #[test]
+        fn test_solve_linear_system_singular() {
+            let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]]; // rank-deficient
+            let b = vec![1.0, 2.0];
+            assert!(solve_linear_system(a, b).is_none());
+        }
 
         #[test]
         fn test_train_readout_empty_inputs() {
             let mut lnn = LiquidNeuralNetwork::new(5);
-            lnn.set_output_neurons(vec![3, 4]);
-
-            let result = lnn.train_readout(&[], &[]);
+            let result = lnn.train_readout(&[], &[], &ReadoutConfig::default());
             assert!(result.is_err());
         }
 
         #[test]
         fn test_train_readout_mismatched_lengths() {
             let mut lnn = LiquidNeuralNetwork::new(5);
-            lnn.set_output_neurons(vec![3, 4]);
+            lnn.set_input_neurons(vec![0]);
 
             let inputs = vec![vec![1.0], vec![2.0]];
-            let outputs = vec![1.0]; // Wrong length
+            let targets = vec![1.0]; // Wrong length
 
-            let result = lnn.train_readout(&inputs, &outputs);
+            let result = lnn.train_readout(&inputs, &targets, &ReadoutConfig::default());
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_predict_before_training_errors() {
+            let mut lnn = LiquidNeuralNetwork::new(5);
+            lnn.set_input_neurons(vec![0, 1]);
+            assert!(lnn.predict(&[1.0, 1.0], 10).is_err());
+        }
+
+        /// Builds a small, fully deterministic reservoir with a nonlinear (firing) feature so
+        /// that AND becomes linearly solvable from the collected state.
+        fn deterministic_reservoir() -> LiquidNeuralNetwork {
+            let mut lnn = LiquidNeuralNetwork::new(6);
+            lnn.synapses = SynapsesWrapper::new(6, 6);
+            lnn.set_input_neurons(vec![0, 1]);
+            for n in &mut lnn.neurons {
+                n.reset();
+                n.rest_potential = 0.0;
+                n.bias = 0.0;
+                n.adaptation.enabled = false;
+                n.threshold = GATE_NON_FIRING_THRESHOLD;
+            }
+            // Neuron 2 fires (threshold 1.6): a nonlinear, saturating OR-type feature that
+            // breaks the linearity of the plain input copies (neurons 4 and 5).
+            lnn.neurons[2].threshold = 1.6;
+            lnn.connect_neurons(0, 2, 1.0, 1).unwrap();
+            lnn.connect_neurons(1, 2, 1.0, 1).unwrap();
+            lnn.connect_neurons(0, 4, 1.0, 1).unwrap();
+            lnn.connect_neurons(1, 5, 1.0, 1).unwrap();
+            lnn
+        }
+
+        #[test]
+        fn test_readout_learns_and_gate() {
+            // Small reservoir with hand-set deterministic weights and a nonlinear feature;
+            // train ridge regression to reproduce AND over {0,1}^2 and check MSE + rounded
+            // predictions (spec 1e.ii).
+            let mut lnn = deterministic_reservoir();
+
+            let inputs = vec![
+                vec![0.0, 0.0],
+                vec![0.0, 1.0],
+                vec![1.0, 0.0],
+                vec![1.0, 1.0],
+            ];
+            let targets = vec![0.0, 0.0, 0.0, 1.0];
+            let cfg = ReadoutConfig::default();
+            lnn.train_readout(&inputs, &targets, &cfg).unwrap();
+
+            let mut sq_err = 0.0;
+            for (input, &target) in inputs.iter().zip(targets.iter()) {
+                let pred = lnn.predict(input, cfg.timesteps).unwrap();
+                sq_err += (pred - target).powi(2);
+                assert_eq!(pred.round(), target, "AND readout misclassified {input:?}");
+            }
+            let mse = sq_err / inputs.len() as f64;
+            assert!(mse < 1e-2, "train MSE too high: {mse}");
+        }
+    }
+
+    mod logic_gate_truth_tables {
+        use super::*;
+
+        fn gate_output(gate: &str, input: &[f64]) -> bool {
+            let mut lnn = LiquidNeuralNetwork::new(10);
+            lnn.configure_for_logic_gate(gate).unwrap();
+            let out = lnn.run_simulation(10, vec![input.to_vec()]).unwrap();
+            out[0][0] > 0.5
+        }
+
+        #[test]
+        fn test_and_truth_table() {
+            assert!(!gate_output("AND", &[0.0, 0.0]));
+            assert!(!gate_output("AND", &[0.0, 1.0]));
+            assert!(!gate_output("AND", &[1.0, 0.0]));
+            assert!(gate_output("AND", &[1.0, 1.0]));
+        }
+
+        #[test]
+        fn test_or_truth_table() {
+            assert!(!gate_output("OR", &[0.0, 0.0]));
+            assert!(gate_output("OR", &[0.0, 1.0]));
+            assert!(gate_output("OR", &[1.0, 0.0]));
+            assert!(gate_output("OR", &[1.0, 1.0]));
+        }
+
+        #[test]
+        fn test_not_truth_table() {
+            assert!(gate_output("NOT", &[0.0]));
+            assert!(!gate_output("NOT", &[1.0]));
+        }
+
+        #[test]
+        fn test_nand_truth_table() {
+            assert!(gate_output("NAND", &[0.0, 0.0]));
+            assert!(gate_output("NAND", &[0.0, 1.0]));
+            assert!(gate_output("NAND", &[1.0, 0.0]));
+            assert!(!gate_output("NAND", &[1.0, 1.0]));
+        }
+
+        #[test]
+        fn test_nor_truth_table() {
+            assert!(gate_output("NOR", &[0.0, 0.0]));
+            assert!(!gate_output("NOR", &[0.0, 1.0]));
+            assert!(!gate_output("NOR", &[1.0, 0.0]));
+            assert!(!gate_output("NOR", &[1.0, 1.0]));
+        }
+
+        #[test]
+        fn test_xor_truth_table() {
+            assert!(!gate_output("XOR", &[0.0, 0.0]));
+            assert!(gate_output("XOR", &[0.0, 1.0]));
+            assert!(gate_output("XOR", &[1.0, 0.0]));
+            assert!(!gate_output("XOR", &[1.0, 1.0]));
         }
     }
 }

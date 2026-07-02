@@ -34,6 +34,7 @@
 //! serialization is mode-independent; only the active mode's layers are evaluated.
 
 use crate::activation::{sigmoid, tanh};
+use crate::error::{LnnError, Result};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +129,27 @@ impl CfcConfig {
         self.backbone_layers = layers;
         self.backbone_units = units;
         self
+    }
+
+    /// Validates the configuration.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Configuration`] if `units < 1`, `tau_min <= 0`,
+    /// `tau_min > tau_max`, or `backbone_layers < 1`.
+    pub fn validate(&self) -> Result<()> {
+        if self.units < 1 {
+            return Err(LnnError::configuration("units must be >= 1"));
+        }
+        if self.tau_min <= 0.0 {
+            return Err(LnnError::configuration("tau_min must be > 0"));
+        }
+        if self.tau_min > self.tau_max {
+            return Err(LnnError::configuration("tau_min must be <= tau_max"));
+        }
+        if self.backbone_layers < 1 {
+            return Err(LnnError::configuration("backbone_layers must be >= 1"));
+        }
+        Ok(())
     }
 }
 
@@ -520,8 +542,23 @@ impl CfcBuilder {
     }
 
     /// Builds the CfC network.
+    ///
+    /// # Panics
+    /// Panics with the validation message if the configuration is invalid. Use
+    /// [`try_build`](Self::try_build) for a non-panicking variant.
     pub fn build(self) -> CfcNetwork {
-        CfcNetwork::with_config(self.input_dim, self.output_dim, self.config).with_dt(self.dt)
+        self.try_build()
+            .unwrap_or_else(|e| panic!("invalid CfcConfig: {e}"))
+    }
+
+    /// Builds the CfC network, returning an error instead of panicking on an invalid
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns the [`CfcConfig::validate`] error if the configuration is invalid.
+    pub fn try_build(self) -> Result<CfcNetwork> {
+        self.config.validate()?;
+        Ok(CfcNetwork::with_config(self.input_dim, self.output_dim, self.config).with_dt(self.dt))
     }
 }
 
@@ -551,6 +588,27 @@ mod tests {
         assert_eq!(config.tau_max, 5.0);
         assert_eq!(config.backbone_layers, 3);
         assert_eq!(config.backbone_units, 48);
+    }
+
+    #[test]
+    fn test_cfc_config_validate() {
+        assert!(CfcConfig::new(16).validate().is_ok());
+        assert!(CfcConfig::new(0).validate().is_err());
+        assert!(CfcConfig::new(16)
+            .with_tau_range(0.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(CfcConfig::new(16)
+            .with_tau_range(5.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(CfcConfig::new(16).with_backbone(0, 16).validate().is_err());
+    }
+
+    #[test]
+    fn test_cfc_builder_try_build() {
+        assert!(CfcBuilder::new(2, 1).hidden_units(8).try_build().is_ok());
+        assert!(CfcBuilder::new(2, 1).backbone(0, 8).try_build().is_err());
     }
 
     #[test]

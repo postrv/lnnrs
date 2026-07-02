@@ -15,6 +15,7 @@
 //! where tau(x,I) is an input-dependent time constant and f(x,I) is the activation function.
 
 use crate::activation::{sigmoid, tanh};
+use crate::error::{LnnError, Result};
 use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,27 @@ impl LtcConfig {
     pub fn with_ode_unfolds(mut self, unfolds: usize) -> Self {
         self.ode_unfolds = unfolds;
         self
+    }
+
+    /// Validates the configuration.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Configuration`] if `units < 1`, `tau_min <= 0`,
+    /// `tau_min > tau_max`, or `ode_unfolds < 1`.
+    pub fn validate(&self) -> Result<()> {
+        if self.units < 1 {
+            return Err(LnnError::configuration("units must be >= 1"));
+        }
+        if self.tau_min <= 0.0 {
+            return Err(LnnError::configuration("tau_min must be > 0"));
+        }
+        if self.tau_min > self.tau_max {
+            return Err(LnnError::configuration("tau_min must be <= tau_max"));
+        }
+        if self.ode_unfolds < 1 {
+            return Err(LnnError::configuration("ode_unfolds must be >= 1"));
+        }
+        Ok(())
     }
 }
 
@@ -419,8 +441,27 @@ impl LtcBuilder {
     }
 
     /// Builds the LTC network.
+    ///
+    /// # Panics
+    /// Panics with the validation message if the configuration is invalid. Use
+    /// [`try_build`](Self::try_build) for a non-panicking variant.
     pub fn build(self) -> LtcNetwork {
-        LtcNetwork::with_config(self.input_dim, self.output_dim, self.config)
+        self.try_build()
+            .unwrap_or_else(|e| panic!("invalid LtcConfig: {e}"))
+    }
+
+    /// Builds the LTC network, returning an error instead of panicking on an invalid
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns the [`LtcConfig::validate`] error if the configuration is invalid.
+    pub fn try_build(self) -> Result<LtcNetwork> {
+        self.config.validate()?;
+        Ok(LtcNetwork::with_config(
+            self.input_dim,
+            self.output_dim,
+            self.config,
+        ))
     }
 }
 
@@ -447,6 +488,27 @@ mod tests {
         assert_eq!(config.tau_max, 5.0);
         assert_eq!(config.tau_base, 2.0);
         assert_eq!(config.ode_unfolds, 10);
+    }
+
+    #[test]
+    fn test_ltc_config_validate() {
+        assert!(LtcConfig::new(16).validate().is_ok());
+        assert!(LtcConfig::new(0).validate().is_err());
+        assert!(LtcConfig::new(16)
+            .with_tau_range(0.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(LtcConfig::new(16)
+            .with_tau_range(5.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(LtcConfig::new(16).with_ode_unfolds(0).validate().is_err());
+    }
+
+    #[test]
+    fn test_ltc_builder_try_build() {
+        assert!(LtcBuilder::new(2, 1).hidden_units(8).try_build().is_ok());
+        assert!(LtcBuilder::new(2, 1).ode_unfolds(0).try_build().is_err());
     }
 
     #[test]

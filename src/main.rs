@@ -27,7 +27,7 @@ use liquid_neural_network::{cfc, input, ltc, output};
 #[derive(Parser)]
 #[command(name = "lnn")]
 #[command(author = "LNN Contributors")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Liquid Neural Network implementation in Rust", long_about = None)]
 struct Cli {
     /// Set the logging level
@@ -228,7 +228,7 @@ fn run_simulation(
 
     // Run simulation
     info!("Running simulation for {} timesteps", timesteps);
-    let outputs = lnn.run_simulation(timesteps, inputs);
+    let outputs = lnn.run_simulation(timesteps, inputs)?;
 
     // Write outputs
     output::write_output_to_csv(output_file, &outputs)?;
@@ -258,7 +258,7 @@ fn test_single_gate(gate_type: &str, timesteps: usize) -> std::result::Result<()
     println!("{}", "-".repeat(40));
 
     for input in test_inputs {
-        let output = lnn.run_simulation(timesteps, vec![input.clone()]);
+        let output = lnn.run_simulation(timesteps, vec![input.clone()])?;
         let output_val = output.last().and_then(|v| v.first()).unwrap_or(&0.0);
         let binary_output = if *output_val > 0.5 { 1 } else { 0 };
 
@@ -513,7 +513,7 @@ fn run_time_series_example(
             lnn.set_input_neurons(vec![0, 1]);
             lnn.set_output_neurons(vec![units - 1]);
             let converted_inputs: Vec<Vec<f64>> = inputs.clone();
-            lnn.run_simulation(1, converted_inputs)
+            lnn.run_simulation(1, converted_inputs)?
         }
     };
 
@@ -566,7 +566,7 @@ mod integration_tests {
 
         // Run simulation
         let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
-        let outputs = lnn.run_simulation(5, inputs);
+        let outputs = lnn.run_simulation(5, inputs).unwrap();
 
         // Verify outputs
         assert_eq!(outputs.len(), 3);
@@ -602,7 +602,7 @@ mod integration_tests {
         ];
 
         for (input, _expected) in test_cases {
-            let output = lnn.run_simulation(10, vec![input]);
+            let output = lnn.run_simulation(10, vec![input]).unwrap();
             assert!(!output.is_empty());
             lnn.reset_state();
         }
@@ -621,7 +621,7 @@ mod integration_tests {
         ];
 
         for (input, _expected) in test_cases {
-            let output = lnn.run_simulation(10, vec![input]);
+            let output = lnn.run_simulation(10, vec![input]).unwrap();
             assert!(!output.is_empty());
             lnn.reset_state();
         }

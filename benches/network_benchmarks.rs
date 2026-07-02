@@ -83,7 +83,7 @@ fn benchmark_lnn_simulation(c: &mut Criterion) {
             let inputs = generate_sine_sequence(length);
 
             b.iter(|| {
-                let outputs = lnn.run_simulation(1, black_box(inputs.clone()));
+                let outputs = lnn.run_simulation(1, black_box(inputs.clone())).unwrap();
                 black_box(outputs)
             });
         });
@@ -165,7 +165,7 @@ fn benchmark_model_comparison(c: &mut Criterion) {
         lnn.set_output_neurons(vec![48, 49]);
 
         b.iter(|| {
-            let outputs = lnn.run_simulation(1, black_box(inputs.clone()));
+            let outputs = lnn.run_simulation(1, black_box(inputs.clone())).unwrap();
             black_box(outputs)
         });
     });
