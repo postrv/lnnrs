@@ -494,7 +494,19 @@ impl TrainableRnn {
     }
 }
 
-/// Computes MSE loss and gradients.
+/// Computes MSE loss and its gradient w.r.t. the predictions.
+///
+/// The loss and gradient share a single normalization factor `n_timesteps * n_dims` so
+/// that the returned gradient is exactly the derivative of the returned loss:
+///
+/// ```text
+/// loss = sum(diff^2) / (n_timesteps * n_dims)
+/// grad = 2 * diff    / (n_timesteps * n_dims)
+/// ```
+///
+/// where `diff = prediction - target`, `n_timesteps = predictions.len()`, and `n_dims` is
+/// the width of a timestep. Empty input (no timesteps or zero-width timesteps) yields a
+/// zero loss and per-timestep zero gradients rather than dividing by zero.
 ///
 /// # Arguments
 /// * `predictions` - Network outputs
@@ -503,9 +515,20 @@ impl TrainableRnn {
 /// # Returns
 /// (loss, gradients w.r.t. predictions)
 pub fn mse_loss_with_grad(predictions: &[Vec<f64>], targets: &[Vec<f64>]) -> (f64, Vec<Vec<f64>>) {
+    let n_timesteps = predictions.len();
+    let n_dims = predictions.first().map_or(0, |p| p.len());
+    let denom = (n_timesteps * n_dims) as f64;
+
+    // Graceful empty input: no loss, and a zero gradient matching each timestep's shape.
+    if denom == 0.0 {
+        return (
+            0.0,
+            predictions.iter().map(|p| vec![0.0; p.len()]).collect(),
+        );
+    }
+
     let mut total_loss = 0.0;
-    let mut grad_outputs = Vec::with_capacity(predictions.len());
-    let n = predictions.len() as f64;
+    let mut grad_outputs = Vec::with_capacity(n_timesteps);
 
     for (pred, target) in predictions.iter().zip(targets.iter()) {
         let mut grad = Vec::with_capacity(pred.len());
@@ -513,14 +536,13 @@ pub fn mse_loss_with_grad(predictions: &[Vec<f64>], targets: &[Vec<f64>]) -> (f6
         for (&p, &t) in pred.iter().zip(target.iter()) {
             let diff = p - t;
             total_loss += diff * diff;
-            // Gradient of MSE: 2 * (pred - target) / n
-            grad.push(2.0 * diff / (n * pred.len() as f64));
+            grad.push(2.0 * diff / denom);
         }
 
         grad_outputs.push(grad);
     }
 
-    (total_loss / n, grad_outputs)
+    (total_loss / denom, grad_outputs)
 }
 
 /// Builder for trainable RNN networks.
@@ -673,6 +695,40 @@ mod tests {
                 assert_relative_eq!(g, 0.0, epsilon = 1e-10);
             }
         }
+    }
+
+    #[test]
+    fn test_mse_loss_with_grad_hand_computed() {
+        // 2 timesteps x 2 dims => denom = n_timesteps * n_dims = 4.
+        let predictions = vec![vec![1.0, 3.0], vec![5.0, 2.0]];
+        let targets = vec![vec![0.0, 1.0], vec![2.0, 2.0]];
+        // diffs: [1, 2], [3, 0]; sum(diff^2) = 1 + 4 + 9 + 0 = 14 => loss = 14 / 4 = 3.5.
+        let (loss, grads) = mse_loss_with_grad(&predictions, &targets);
+        assert_relative_eq!(loss, 3.5, epsilon = 1e-12);
+
+        // grad = 2 * diff / 4 = diff / 2.
+        let expected = [[0.5, 1.0], [1.5, 0.0]];
+        for (grad, exp) in grads.iter().zip(expected.iter()) {
+            for (&g, &e) in grad.iter().zip(exp.iter()) {
+                assert_relative_eq!(g, e, epsilon = 1e-12);
+            }
+        }
+
+        // Loss must be exactly the mean of grad-weighted diffs: gradient is the analytic
+        // derivative of the loss (both divided by the same denom).
+        let recomputed: f64 = predictions
+            .iter()
+            .zip(targets.iter())
+            .flat_map(|(p, t)| p.iter().zip(t.iter()))
+            .map(|(&p, &t)| (p - t).powi(2))
+            .sum::<f64>()
+            / 4.0;
+        assert_relative_eq!(loss, recomputed, epsilon = 1e-12);
+
+        // Empty input is handled gracefully: zero loss, no gradients.
+        let (empty_loss, empty_grads) = mse_loss_with_grad(&[], &[]);
+        assert_eq!(empty_loss, 0.0);
+        assert!(empty_grads.is_empty());
     }
 
     #[test]

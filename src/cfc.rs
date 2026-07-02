@@ -1,21 +1,37 @@
 // src/cfc.rs
 //! Closed-form Continuous-depth (CfC) neural network implementation.
 //!
-//! CfC networks are a variant of Liquid Time-Constant networks that use a closed-form
-//! solution instead of numerical ODE integration. This provides significant computational
-//! speedup while maintaining the expressive power of continuous-time models.
+//! CfC networks are a variant of Liquid Time-Constant networks that replace numerical
+//! ODE integration with a closed-form update, providing significant computational speedup
+//! while retaining the expressive power of continuous-time models.
 //!
 //! Based on "Closed-form Continuous-Time Neural Networks" (Hasani et al., 2022).
 //!
-//! The key insight is that the LTC ODE:
-//! ```text
-//! τ * dx/dt = -x + f(Wx + b)
-//! ```
+//! This module supports two update modes, selected by [`CfcConfig::no_gate`]:
 //!
-//! Has a closed-form solution when f is approximated appropriately:
-//! ```text
-//! x(t+Δt) = x(t) * exp(-Δt/τ) + (1 - exp(-Δt/τ)) * f(Wx + b)
-//! ```
+//! * **Gated (default, `no_gate = false`).** The reference CfC formulation. A shared
+//!   backbone produces features `z = backbone([state, input])`, from which two candidate
+//!   heads and a time-dependent interpolation gate are derived:
+//!   ```text
+//!   ff1      = tanh(W1 z + b1)
+//!   ff2      = tanh(W2 z + b2)
+//!   t_a      = Wa z + ba,   t_b = Wb z + bb
+//!   t_interp = sigmoid(t_a * dt + t_b)                    (elementwise)
+//!   x_new    = ff1 * (1 - t_interp) + t_interp * ff2      (elementwise)
+//!   ```
+//!   Because `x_new` is a convex combination of two `tanh` heads, it is bounded in
+//!   `[-1, 1]`.
+//!
+//! * **Decay (`no_gate = true`).** The pure exponential-decay closed form, equivalent to
+//!   an LTC neuron solved in closed form:
+//!   ```text
+//!   x(t+dt) = x(t) * exp(-dt/tau) + (1 - exp(-dt/tau)) * f(z)
+//!   ```
+//!   using an input-dependent time constant `tau` and `f(z) = tanh(W z + b)`.
+//!
+//! The decay-mode layers (`ff_projection`, `tau_layer`) and the gated-mode heads
+//! (`ff1`, `ff2`, `time_a`, `time_b`) are all constructed unconditionally so that
+//! serialization is mode-independent; only the active mode's layers are evaluated.
 
 use crate::activation::{sigmoid, tanh};
 use rand::{thread_rng, Rng};
@@ -150,8 +166,8 @@ impl DenseLayer {
     fn forward(&self, input: &[f64]) -> Vec<f64> {
         let mut output = self.bias.clone();
         for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for j in 0..self.output_dim {
-                output[j] += self.weights[i][j] * inp;
+            for (out, &w) in output.iter_mut().zip(self.weights[i].iter()) {
+                *out += w * inp;
             }
         }
         output
@@ -204,26 +220,41 @@ impl Backbone {
 
 /// CfC Cell implementing the closed-form continuous-time dynamics.
 ///
-/// The cell computes:
-/// 1. Backbone features from [state, input]
-/// 2. Time constants τ (input-dependent)
-/// 3. New state using the closed-form solution
+/// The cell computes backbone features `z` from the concatenated `[state, input]` vector
+/// and then updates the state using one of two modes (see the [module docs](crate::cfc)):
+///
+/// * gated (`no_gate = false`): `x_new = ff1 * (1 - t_interp) + t_interp * ff2`,
+/// * decay (`no_gate = true`): the exponential-decay closed form using an input-dependent
+///   time constant.
+///
+/// Both modes' layers are constructed unconditionally so serialization is mode-independent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfcCell {
     /// Configuration
     pub config: CfcConfig,
     /// Backbone network
     backbone: Backbone,
-    /// Projection to state update (ff from backbone to state)
+    /// Decay-mode: projection from backbone features to the target state `f(z)`
     ff_projection: DenseLayer,
-    /// Time constant computation weights
+    /// Decay-mode: input-dependent time-constant logits
     tau_layer: DenseLayer,
+    /// Gated-mode: first candidate head (pre-`tanh`)
+    ff1: DenseLayer,
+    /// Gated-mode: second candidate head (pre-`tanh`)
+    ff2: DenseLayer,
+    /// Gated-mode: time-gate slope term `t_a`
+    time_a: DenseLayer,
+    /// Gated-mode: time-gate offset term `t_b`
+    time_b: DenseLayer,
     /// Input dimension
     input_dim: usize,
 }
 
 impl CfcCell {
     /// Creates a new CfC cell.
+    ///
+    /// All layers for both the gated and decay modes are constructed; only the layers of
+    /// the mode selected by [`CfcConfig::no_gate`] are evaluated during [`CfcCell::forward`].
     pub fn new(input_dim: usize, config: CfcConfig) -> Self {
         let state_input_dim = config.units + input_dim;
 
@@ -235,18 +266,27 @@ impl CfcCell {
         );
 
         let backbone_out_dim = backbone.output_dim();
+        let units = config.units;
 
-        // Projection from backbone to state update
-        let ff_projection = DenseLayer::new(backbone_out_dim, config.units);
+        // Decay-mode layers.
+        let ff_projection = DenseLayer::new(backbone_out_dim, units);
+        let tau_layer = DenseLayer::new(backbone_out_dim, units);
 
-        // Time constant layer
-        let tau_layer = DenseLayer::new(backbone_out_dim, config.units);
+        // Gated-mode heads.
+        let ff1 = DenseLayer::new(backbone_out_dim, units);
+        let ff2 = DenseLayer::new(backbone_out_dim, units);
+        let time_a = DenseLayer::new(backbone_out_dim, units);
+        let time_b = DenseLayer::new(backbone_out_dim, units);
 
         CfcCell {
             config,
             backbone,
             ff_projection,
             tau_layer,
+            ff1,
+            ff2,
+            time_a,
+            time_b,
             input_dim,
         }
     }
@@ -272,26 +312,32 @@ impl CfcCell {
             .collect()
     }
 
-    /// Performs one forward pass using the closed-form solution.
+    /// Performs one forward pass.
     ///
-    /// x(t+1) = x(t) * exp(-1/τ) + (1 - exp(-1/τ)) * f(backbone([x, input]))
+    /// In gated mode (`no_gate = false`) computes
+    /// `x_new = ff1 * (1 - t_interp) + t_interp * ff2`, where
+    /// `t_interp = sigmoid(t_a * dt + t_b)` and `ff1`/`ff2` are `tanh` heads.
+    ///
+    /// In decay mode (`no_gate = true`) computes the exponential-decay closed form
+    /// `x_new = x * exp(-dt/tau) + (1 - exp(-dt/tau)) * f(z)`.
     pub fn forward(&self, state: &[f64], input: &[f64], dt: f64) -> Vec<f64> {
-        // Concatenate state and input for backbone
+        // Concatenate state and input for the backbone.
         let mut combined = state.to_vec();
         combined.extend_from_slice(input);
 
-        // Compute backbone features
+        // Compute backbone features z = backbone([state, input]).
         let features = self.backbone.forward(&combined);
 
-        // Compute time constants
-        let tau = self.compute_tau(&features);
-
-        // Compute target state (what we'd converge to)
-        let ff_raw = self.ff_projection.forward(&features);
-        let ff: Vec<f64> = ff_raw.iter().map(|&x| tanh(x)).collect();
-
         if self.config.no_gate {
-            // Simple version: direct interpolation
+            // Decay (pure) mode: closed-form exponential decay toward f(z) = tanh(W z + b).
+            let tau = self.compute_tau(&features);
+            let ff: Vec<f64> = self
+                .ff_projection
+                .forward(&features)
+                .iter()
+                .map(|&x| tanh(x))
+                .collect();
+
             state
                 .iter()
                 .zip(ff.iter())
@@ -302,14 +348,27 @@ impl CfcCell {
                 })
                 .collect()
         } else {
-            // Full version with additional gating
-            let decay: Vec<f64> = tau.iter().map(|&t| (-dt / t).exp()).collect();
-
-            state
+            // Gated (default) mode: interpolate two tanh heads with a time-dependent gate.
+            let ff1: Vec<f64> = self
+                .ff1
+                .forward(&features)
                 .iter()
-                .zip(ff.iter())
-                .zip(decay.iter())
-                .map(|((&x, &f), &d)| x * d + (1.0 - d) * f)
+                .map(|&x| tanh(x))
+                .collect();
+            let ff2: Vec<f64> = self
+                .ff2
+                .forward(&features)
+                .iter()
+                .map(|&x| tanh(x))
+                .collect();
+            let t_a = self.time_a.forward(&features);
+            let t_b = self.time_b.forward(&features);
+
+            (0..self.config.units)
+                .map(|i| {
+                    let t_interp = sigmoid(t_a[i] * dt + t_b[i]);
+                    ff1[i] * (1.0 - t_interp) + t_interp * ff2[i]
+                })
                 .collect()
         }
     }
@@ -516,7 +575,7 @@ mod tests {
     #[test]
     fn test_backbone() {
         let backbone = Backbone::new(10, 16, 2, BackboneActivation::SiLU);
-        let output = backbone.forward(&vec![0.5; 10]);
+        let output = backbone.forward(&[0.5; 10]);
         assert_eq!(output.len(), 16);
     }
 
@@ -693,7 +752,77 @@ mod tests {
 
         // All time constants should be in range
         for &t in &tau {
-            assert!(t >= 0.1 && t <= 10.0, "tau {} out of range", t);
+            assert!((0.1..=10.0).contains(&t), "tau {} out of range", t);
+        }
+    }
+
+    #[test]
+    fn test_cfc_gated_vs_no_gate_differ() {
+        // Build one gated cell, then clone it and flip `no_gate` so both modes share
+        // identical weights (constructors are randomly initialized, so cloning is the
+        // only way to guarantee a fair comparison). The gated and decay updates read
+        // disjoint layers, so the sequences must differ.
+        let gated = CfcCell::new(2, CfcConfig::new(8));
+        assert!(!gated.config.no_gate);
+
+        let mut ungated = gated.clone();
+        ungated.config.no_gate = true;
+
+        let inputs = vec![vec![1.0, -0.5], vec![0.3, 0.7], vec![-1.0, 0.2]];
+        let gated_seq = gated.forward_sequence(&inputs, 1.0);
+        let ungated_seq = ungated.forward_sequence(&inputs, 1.0);
+
+        let differ = gated_seq
+            .iter()
+            .zip(ungated_seq.iter())
+            .flat_map(|(a, b)| a.iter().zip(b.iter()))
+            .any(|(&x, &y)| (x - y).abs() > 1e-9);
+
+        assert!(
+            differ,
+            "gated and no-gate modes should produce different sequences"
+        );
+    }
+
+    #[test]
+    fn test_cfc_gated_bounded() {
+        // The gated update is a convex combination of two tanh heads, so every state
+        // component must stay within [-1, 1] even for large, sustained inputs.
+        let cell = CfcCell::new(2, CfcConfig::new(8));
+        assert!(!cell.config.no_gate);
+
+        let inputs: Vec<Vec<f64>> = (0..50).map(|_| vec![10.0, -10.0]).collect();
+        let seq = cell.forward_sequence(&inputs, 1.0);
+
+        for state in &seq {
+            for &v in state {
+                assert!(
+                    (-1.0..=1.0).contains(&v),
+                    "gated state component {} out of [-1, 1]",
+                    v
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cfc_cell_serialization() {
+        // Round-trips must preserve every layer for both modes; JSON float encoding can
+        // shift the final ULP, so compare within a tight tolerance.
+        let cell = CfcCell::new(3, CfcConfig::new(8));
+
+        let json = serde_json::to_string(&cell).unwrap();
+        let restored: CfcCell = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(cell.units(), restored.units());
+        assert_eq!(cell.input_dim(), restored.input_dim());
+
+        let state = cell.initial_state();
+        let input = vec![0.5, -0.2, 0.1];
+        let before = cell.forward(&state, &input, 1.0);
+        let after = restored.forward(&state, &input, 1.0);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
         }
     }
 }

@@ -9,13 +9,13 @@
 //! The key equation governing LTC neurons is:
 //!
 //! ```text
-//! τ(x,I) * dx/dt = -x + f(x,I)
+//! tau(x,I) * dx/dt = -x + f(x,I)
 //! ```
 //!
-//! where τ(x,I) is an input-dependent time constant and f(x,I) is the activation function.
+//! where tau(x,I) is an input-dependent time constant and f(x,I) is the activation function.
 
 use crate::activation::{sigmoid, tanh};
-use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4, SolverConfig};
+use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
@@ -30,9 +30,8 @@ pub struct LtcConfig {
     pub tau_min: f64,
     /// Maximum time constant
     pub tau_max: f64,
-    /// ODE solver step size
-    pub ode_step: f64,
-    /// Number of ODE steps per timestep
+    /// Number of fixed RK4 sub-steps used to integrate one logical timestep over `[0, 1]`
+    /// (the integration step size is `1.0 / ode_unfolds`). Must be `>= 1`.
     pub ode_unfolds: usize,
 }
 
@@ -43,7 +42,6 @@ impl Default for LtcConfig {
             tau_base: 1.0,
             tau_min: 0.1,
             tau_max: 10.0,
-            ode_step: 0.1,
             ode_unfolds: 6,
         }
     }
@@ -71,9 +69,10 @@ impl LtcConfig {
         self
     }
 
-    /// Sets the ODE solver parameters.
-    pub fn with_ode_params(mut self, step: f64, unfolds: usize) -> Self {
-        self.ode_step = step;
+    /// Sets the number of RK4 sub-steps used to integrate one logical timestep.
+    ///
+    /// Larger values give a more accurate integration of the LTC ODE at higher cost.
+    pub fn with_ode_unfolds(mut self, unfolds: usize) -> Self {
         self.ode_unfolds = unfolds;
         self
     }
@@ -156,7 +155,7 @@ impl LtcCell {
 
     /// Computes the input-dependent time constant for each unit.
     ///
-    /// τ(I) = tau_min + (tau_max - tau_min) * sigmoid(tau_weights * |I| + tau_bias)
+    /// tau(I) = tau_min + (tau_max - tau_min) * sigmoid(tau_weights * |I| + tau_bias)
     fn compute_tau(&self, input: &[f64]) -> Vec<f64> {
         let input_magnitude: f64 = input.iter().map(|x| x.abs()).sum();
 
@@ -172,14 +171,13 @@ impl LtcCell {
 
     /// Computes the pre-activation: W_in * input + W_rec * state + bias
     fn pre_activation(&self, state: &[f64], input: &[f64]) -> Vec<f64> {
-        let units = self.config.units;
         let mut result = self.bias.clone();
 
         // Input contribution: W_in * input
         for (i, &inp) in input.iter().enumerate() {
             if i < self.w_in.len() {
-                for j in 0..units {
-                    result[j] += self.w_in[i][j] * inp;
+                for (r, &w) in result.iter_mut().zip(self.w_in[i].iter()) {
+                    *r += w * inp;
                 }
             }
         }
@@ -187,8 +185,8 @@ impl LtcCell {
         // Recurrent contribution: W_rec * state
         for (i, &s) in state.iter().enumerate() {
             if i < self.w_rec.len() {
-                for j in 0..units {
-                    result[j] += self.w_rec[i][j] * s;
+                for (r, &w) in result.iter_mut().zip(self.w_rec[i].iter()) {
+                    *r += w * s;
                 }
             }
         }
@@ -212,7 +210,10 @@ impl LtcCell {
 
     /// Performs one forward pass using ODE integration.
     ///
-    /// Integrates the LTC ODE from t=0 to t=1 (one logical timestep).
+    /// Integrates the LTC ODE over `t` in `[0, 1]` (one logical timestep) with exactly
+    /// `config.ode_unfolds` fixed RK4 sub-steps of size `dt = 1.0 / ode_unfolds`, applying
+    /// [`RungeKutta4::step`] directly. There is no adaptive stepping and no error path to
+    /// swallow: `ode_unfolds` is the single source of truth for integration effort.
     pub fn forward(&self, state: &[f64], input: &[f64]) -> Vec<f64> {
         let system = LtcOdeSystem {
             cell: self,
@@ -220,13 +221,18 @@ impl LtcCell {
         };
 
         let solver = RungeKutta4;
-        let config = SolverConfig::new(self.config.ode_step);
+        // `ode_unfolds` must be >= 1 (validated at config-build time in section 1f); guard
+        // defensively here so a degenerate config can never divide by zero.
+        let unfolds = self.config.ode_unfolds.max(1);
+        let dt = 1.0 / unfolds as f64;
 
-        let result = solver
-            .integrate(&system, state.to_vec(), input, 0.0, 1.0, &config)
-            .unwrap_or_else(|_| OdeState::new(state.to_vec()));
+        let mut ode_state = OdeState::new(state.to_vec());
+        for _ in 0..unfolds {
+            solver.step(&system, &mut ode_state, input, dt);
+            ode_state.time += dt;
+        }
 
-        result.values
+        ode_state.values
     }
 
     /// Processes a sequence of inputs.
@@ -336,8 +342,8 @@ impl LtcNetwork {
         let mut output = self.b_out.clone();
         for (i, &h) in hidden.iter().enumerate() {
             if i < self.w_out.len() {
-                for j in 0..self.output_dim {
-                    output[j] += self.w_out[i][j] * h;
+                for (o, &w) in output.iter_mut().zip(self.w_out[i].iter()) {
+                    *o += w * h;
                 }
             }
         }
@@ -406,9 +412,8 @@ impl LtcBuilder {
         self
     }
 
-    /// Sets the ODE integration parameters.
-    pub fn ode_params(mut self, step: f64, unfolds: usize) -> Self {
-        self.config.ode_step = step;
+    /// Sets the number of RK4 sub-steps used to integrate one logical timestep.
+    pub fn ode_unfolds(mut self, unfolds: usize) -> Self {
         self.config.ode_unfolds = unfolds;
         self
     }
@@ -435,13 +440,12 @@ mod tests {
         let config = LtcConfig::new(32)
             .with_tau_range(0.5, 5.0)
             .with_tau_base(2.0)
-            .with_ode_params(0.05, 10);
+            .with_ode_unfolds(10);
 
         assert_eq!(config.units, 32);
         assert_eq!(config.tau_min, 0.5);
         assert_eq!(config.tau_max, 5.0);
         assert_eq!(config.tau_base, 2.0);
-        assert_eq!(config.ode_step, 0.05);
         assert_eq!(config.ode_unfolds, 10);
     }
 
@@ -465,14 +469,14 @@ mod tests {
 
         let tau = cell.compute_tau(&[0.0, 0.0]);
         for &t in &tau {
-            assert!(t >= 0.1 && t <= 10.0);
+            assert!((0.1..=10.0).contains(&t));
         }
 
         // Higher input should affect tau
         let tau_high = cell.compute_tau(&[10.0, 10.0]);
         // Just verify it's in range (actual direction depends on weights)
         for &t in &tau_high {
-            assert!(t >= 0.1 && t <= 10.0);
+            assert!((0.1..=10.0).contains(&t));
         }
     }
 
@@ -551,11 +555,53 @@ mod tests {
         let network = LtcBuilder::new(4, 2)
             .hidden_units(32)
             .tau_range(0.5, 5.0)
-            .ode_params(0.05, 8)
+            .ode_unfolds(8)
             .build();
 
         assert_eq!(network.hidden_dim(), 32);
         assert_eq!(network.output_dim(), 2);
+    }
+
+    #[test]
+    fn test_ltc_ode_unfolds_effect_and_convergence() {
+        // Build one cell, then clone it and vary only `ode_unfolds` so all three cells
+        // share identical weights. A coarser integration (fewer unfolds) must give a
+        // measurably different result, and refining the integration must converge toward
+        // the finest reference (unfolds = 32). Small time constants are used so that the
+        // dynamics are fast enough for the step count to matter over the [0, 1] window.
+        let config = LtcConfig::new(16)
+            .with_tau_range(0.2, 0.6)
+            .with_tau_base(0.3);
+        let cell1 = LtcCell::new(2, config.with_ode_unfolds(1));
+        let mut cell8 = cell1.clone();
+        cell8.config.ode_unfolds = 8;
+        let mut cell32 = cell1.clone();
+        cell32.config.ode_unfolds = 32;
+
+        let state = cell1.initial_state();
+        let input = vec![2.0, -2.0];
+
+        let out1 = cell1.forward(&state, &input);
+        let out8 = cell8.forward(&state, &input);
+        let out32 = cell32.forward(&state, &input);
+
+        let sq_err = |a: &[f64], b: &[f64]| -> f64 {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
+        };
+
+        let err_1 = sq_err(&out1, &out32);
+        let err_8 = sq_err(&out8, &out32);
+
+        // unfolds = 1 must differ from the fine reference.
+        assert!(
+            err_1 > 1e-9,
+            "unfolds=1 should differ from unfolds=32 (err = {err_1})"
+        );
+        // Refining the integration converges: unfolds = 8 is closer than unfolds = 1.
+        assert!(
+            err_8 < err_1,
+            "unfolds=8 should be closer to unfolds=32 than unfolds=1 ({err_8} !< {err_1})"
+        );
     }
 
     #[test]
