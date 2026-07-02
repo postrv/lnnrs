@@ -129,9 +129,9 @@ pub struct LtcCell {
     pub w_in: DenseLayer,
     /// Recurrent projection `W_rec` (`units -> units`); its bias is zero.
     pub w_rec: DenseLayer,
-    /// Time constant weights (for input-dependent tau) [units]
+    /// Time constant weights for the input-dependent tau (length `units`).
     pub tau_weights: Vec<f64>,
-    /// Time constant bias [units]
+    /// Time constant bias (length `units`).
     pub tau_bias: Vec<f64>,
     /// Input dimension
     input_dim: usize,

@@ -67,9 +67,13 @@ pub struct CfcConfig {
 /// Activation function for the backbone network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackboneActivation {
+    /// Hyperbolic tangent, mapping to `(-1, 1)`.
     Tanh,
+    /// Rectified linear unit, `max(0, x)`.
     ReLU,
+    /// Sigmoid-weighted linear unit (a.k.a. swish), `x * sigmoid(x)`.
     SiLU,
+    /// Gaussian error linear unit (tanh approximation).
     GELU,
 }
 

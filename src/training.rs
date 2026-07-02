@@ -41,7 +41,7 @@ pub struct BpttConfig {
     /// Global-norm gradient-clipping threshold.
     ///
     /// When `Some(max_norm)`, all of a model's gradient tensors are rescaled jointly (see
-    /// [`clip_grad_norm`](crate::optim::clip_grad_norm)) so their combined L2 norm does not
+    /// [`clip_grad_norm`]) so their combined L2 norm does not
     /// exceed `max_norm`, applied once before the optimizer step. `None` disables clipping.
     /// (This replaces the earlier per-element gradient clamping; the standalone
     /// [`TrainableDense::update`] still clamps per element for backward compatibility.)

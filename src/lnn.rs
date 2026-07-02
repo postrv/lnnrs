@@ -24,20 +24,29 @@ const GATE_NON_FIRING_THRESHOLD: f64 = 1e9;
 /// Supported logic gate types for network configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicGate {
+    /// Logical AND: true iff both inputs are true.
     And,
+    /// Logical OR: true iff at least one input is true.
     Or,
+    /// Logical NOT: inverts a single input.
     Not,
+    /// Logical NAND: the negation of AND.
     Nand,
+    /// Logical NOR: the negation of OR.
     Nor,
+    /// Logical XOR: true iff the inputs differ.
     Xor,
 }
 
-impl LogicGate {
-    /// Parses a string into a LogicGate variant.
-    // A `FromStr` trait implementation is deferred to a later phase; the inherent method is
-    // retained here for the current call sites.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Result<Self> {
+impl std::str::FromStr for LogicGate {
+    type Err = LnnError;
+
+    /// Parses a gate name (case-insensitive) into a [`LogicGate`].
+    ///
+    /// # Errors
+    /// Returns [`LnnError::InvalidGateType`] if `s` is not one of `AND`, `OR`, `NOT`,
+    /// `NAND`, `NOR`, or `XOR` (matched case-insensitively).
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
             "AND" => Ok(LogicGate::And),
             "OR" => Ok(LogicGate::Or),
@@ -979,7 +988,7 @@ impl LiquidNeuralNetwork {
     /// # Returns
     /// `Ok(())` if configuration succeeds, `Err` if gate type is invalid
     pub fn configure_for_logic_gate(&mut self, gate_type: &str) -> Result<()> {
-        let gate = LogicGate::from_str(gate_type)?;
+        let gate: LogicGate = gate_type.parse()?;
         self.configure_gate(gate);
         Ok(())
     }
@@ -1246,12 +1255,19 @@ impl LiquidNeuralNetwork {
 /// Statistics about a neural network's structure.
 #[derive(Debug, Clone)]
 pub struct NetworkStatistics {
+    /// Total number of neurons in the network.
     pub neuron_count: usize,
+    /// Total number of synapses (connections) in the network.
     pub synapse_count: usize,
+    /// Number of synapses with a positive (excitatory) weight.
     pub excitatory_synapse_count: usize,
+    /// Number of synapses with a negative (inhibitory) weight.
     pub inhibitory_synapse_count: usize,
+    /// Mean synaptic weight across all synapses.
     pub average_weight: f64,
+    /// Number of neurons designated as inputs.
     pub input_neuron_count: usize,
+    /// Number of neurons designated as outputs.
     pub output_neuron_count: usize,
 }
 
@@ -1527,17 +1543,17 @@ mod tests {
 
         #[test]
         fn test_logic_gate_parsing() {
-            assert_eq!(LogicGate::from_str("AND").unwrap(), LogicGate::And);
-            assert_eq!(LogicGate::from_str("or").unwrap(), LogicGate::Or);
-            assert_eq!(LogicGate::from_str("Not").unwrap(), LogicGate::Not);
-            assert_eq!(LogicGate::from_str("NAND").unwrap(), LogicGate::Nand);
-            assert_eq!(LogicGate::from_str("NOR").unwrap(), LogicGate::Nor);
-            assert_eq!(LogicGate::from_str("XOR").unwrap(), LogicGate::Xor);
+            assert_eq!("AND".parse::<LogicGate>().unwrap(), LogicGate::And);
+            assert_eq!("or".parse::<LogicGate>().unwrap(), LogicGate::Or);
+            assert_eq!("Not".parse::<LogicGate>().unwrap(), LogicGate::Not);
+            assert_eq!("NAND".parse::<LogicGate>().unwrap(), LogicGate::Nand);
+            assert_eq!("NOR".parse::<LogicGate>().unwrap(), LogicGate::Nor);
+            assert_eq!("XOR".parse::<LogicGate>().unwrap(), LogicGate::Xor);
         }
 
         #[test]
         fn test_invalid_gate_type() {
-            let result = LogicGate::from_str("INVALID");
+            let result = "INVALID".parse::<LogicGate>();
             assert!(result.is_err());
         }
 

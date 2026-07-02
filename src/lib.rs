@@ -61,6 +61,8 @@
 //! For `TrainableRnn`, use `TrainableRnnBuilder::new(..).seed(u64)` or the direct
 //! constructor `TrainableRnn::with_seed(input, hidden, output, Some(seed))`.
 
+#![warn(missing_docs)]
+
 pub mod activation;
 pub mod cfc;
 pub mod error;

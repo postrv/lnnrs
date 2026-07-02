@@ -306,9 +306,13 @@ impl Neuron {
 /// Struct to hold neuron state derivatives for ODE integration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeuronDerivatives {
+    /// Time derivative of the membrane potential.
     pub d_membrane_potential: f64,
+    /// Time derivative of the gating variable.
     pub d_gating_variable: f64,
+    /// Time derivative of the time constant.
     pub d_time_constant: f64,
+    /// Time derivative of the recovery variable.
     pub d_recovery: f64,
 }
 

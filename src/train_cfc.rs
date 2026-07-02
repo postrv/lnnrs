@@ -6,8 +6,8 @@
 //! drive the closed-form gated update -- plus a trainable output projection. The forward
 //! pass caches every per-timestep intermediate needed to differentiate the update
 //! analytically, and [`TrainableCfc::backward`] implements truncated BPTT through the
-//! closed-form dynamics. Parameters are updated with the [`Adam`](crate::optim::Adam)
-//! optimizer after global-norm gradient clipping.
+//! closed-form dynamics. Parameters are updated with the [`Adam`] optimizer after
+//! global-norm gradient clipping.
 //!
 //! Only the gated CfC is trainable here; the decay (`no_gate`) variant is rejected at
 //! construction time.

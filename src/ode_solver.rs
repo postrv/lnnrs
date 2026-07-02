@@ -565,6 +565,7 @@ pub struct ExponentialDecay {
 }
 
 impl ExponentialDecay {
+    /// Creates an exponential-decay system `dy/dt = -decay_rate * y`.
     pub fn new(decay_rate: f64) -> Self {
         ExponentialDecay { decay_rate }
     }
@@ -587,6 +588,8 @@ pub struct HarmonicOscillator {
 }
 
 impl HarmonicOscillator {
+    /// Creates an undamped harmonic oscillator with angular frequency `omega`
+    /// (`dy/dt = v`, `dv/dt = -omega^2 * y`).
     pub fn new(omega: f64) -> Self {
         HarmonicOscillator { omega }
     }
