@@ -9,14 +9,18 @@
 //! The key equation governing LTC neurons is:
 //!
 //! ```text
-//! τ(x,I) * dx/dt = -x + f(x,I)
+//! tau(x,I) * dx/dt = -x + f(x,I)
 //! ```
 //!
-//! where τ(x,I) is an input-dependent time constant and f(x,I) is the activation function.
+//! where tau(x,I) is an input-dependent time constant and f(x,I) is the activation function.
 
 use crate::activation::{sigmoid, tanh};
-use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4, SolverConfig};
-use rand::{thread_rng, Rng};
+use crate::error::{LnnError, Result};
+use crate::layers::DenseLayer;
+use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4};
+use ndarray::ArrayView1;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for LTC layers.
@@ -30,10 +34,13 @@ pub struct LtcConfig {
     pub tau_min: f64,
     /// Maximum time constant
     pub tau_max: f64,
-    /// ODE solver step size
-    pub ode_step: f64,
-    /// Number of ODE steps per timestep
+    /// Number of fixed RK4 sub-steps used to integrate one logical timestep over `[0, 1]`
+    /// (the integration step size is `1.0 / ode_unfolds`). Must be `>= 1`.
     pub ode_unfolds: usize,
+    /// Optional seed for reproducible random initialization. `Some(seed)` seeds a `StdRng`
+    /// with `seed`; `None` seeds from entropy.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for LtcConfig {
@@ -43,8 +50,8 @@ impl Default for LtcConfig {
             tau_base: 1.0,
             tau_min: 0.1,
             tau_max: 10.0,
-            ode_step: 0.1,
             ode_unfolds: 6,
+            seed: None,
         }
     }
 }
@@ -71,11 +78,39 @@ impl LtcConfig {
         self
     }
 
-    /// Sets the ODE solver parameters.
-    pub fn with_ode_params(mut self, step: f64, unfolds: usize) -> Self {
-        self.ode_step = step;
+    /// Sets the number of RK4 sub-steps used to integrate one logical timestep.
+    ///
+    /// Larger values give a more accurate integration of the LTC ODE at higher cost.
+    pub fn with_ode_unfolds(mut self, unfolds: usize) -> Self {
         self.ode_unfolds = unfolds;
         self
+    }
+
+    /// Sets the seed for reproducible random initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Validates the configuration.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Configuration`] if `units < 1`, `tau_min <= 0`,
+    /// `tau_min > tau_max`, or `ode_unfolds < 1`.
+    pub fn validate(&self) -> Result<()> {
+        if self.units < 1 {
+            return Err(LnnError::configuration("units must be >= 1"));
+        }
+        if self.tau_min <= 0.0 {
+            return Err(LnnError::configuration("tau_min must be > 0"));
+        }
+        if self.tau_min > self.tau_max {
+            return Err(LnnError::configuration("tau_min must be <= tau_max"));
+        }
+        if self.ode_unfolds < 1 {
+            return Err(LnnError::configuration("ode_unfolds must be >= 1"));
+        }
+        Ok(())
     }
 }
 
@@ -89,15 +124,14 @@ impl LtcConfig {
 pub struct LtcCell {
     /// Configuration
     pub config: LtcConfig,
-    /// Input weights [input_dim x units]
-    pub w_in: Vec<Vec<f64>>,
-    /// Recurrent weights [units x units]
-    pub w_rec: Vec<Vec<f64>>,
-    /// Bias terms [units]
-    pub bias: Vec<f64>,
-    /// Time constant weights (for input-dependent tau) [units]
+    /// Input projection `W_in` (`input_dim -> units`). Its bias doubles as the cell bias
+    /// (added once to the pre-activation), replacing the former separate `bias` field.
+    pub w_in: DenseLayer,
+    /// Recurrent projection `W_rec` (`units -> units`); its bias is zero.
+    pub w_rec: DenseLayer,
+    /// Time constant weights for the input-dependent tau (length `units`).
     pub tau_weights: Vec<f64>,
-    /// Time constant bias [units]
+    /// Time constant bias (length `units`).
     pub tau_bias: Vec<f64>,
     /// Input dimension
     input_dim: usize,
@@ -105,39 +139,40 @@ pub struct LtcCell {
 
 impl LtcCell {
     /// Creates a new LTC cell with random initialization.
+    ///
+    /// This is a self-contained convenience constructor: it creates its own [`StdRng`] from
+    /// `config.seed` (or from entropy when unseeded). When building a full [`LtcNetwork`],
+    /// [`LtcCell::with_rng`] is used instead so the cell and the output projection share a
+    /// single generator.
     pub fn new(input_dim: usize, config: LtcConfig) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_os_rng(),
+        };
+        Self::with_rng(input_dim, config, &mut rng)
+    }
+
+    /// Creates a new LTC cell drawing all weights from the supplied generator.
+    ///
+    /// Threading a single [`StdRng`] through every layer of a network is what makes
+    /// construction reproducible; higher-level constructors ([`LtcNetwork::with_config`])
+    /// call this so unit ordering is stable.
+    pub fn with_rng(input_dim: usize, config: LtcConfig, rng: &mut StdRng) -> Self {
         let units = config.units;
 
-        // Xavier/Glorot initialization
-        let in_scale = (2.0 / (input_dim + units) as f64).sqrt();
-        let rec_scale = (2.0 / (units + units) as f64).sqrt();
+        // Xavier/Glorot initialization via the shared layer. `DenseLayer::new` uses
+        // `scale = sqrt(2 / (in + out))`, which reproduces the previous `in_scale`/`rec_scale`
+        // exactly. The cell bias is `w_in`'s (zero-initialised) bias.
+        let w_in = DenseLayer::new(input_dim, units, rng);
+        let w_rec = DenseLayer::new(units, units, rng);
 
-        let w_in: Vec<Vec<f64>> = (0..input_dim)
-            .map(|_| {
-                (0..units)
-                    .map(|_| rng.gen_range(-in_scale..in_scale))
-                    .collect()
-            })
-            .collect();
-
-        let w_rec: Vec<Vec<f64>> = (0..units)
-            .map(|_| {
-                (0..units)
-                    .map(|_| rng.gen_range(-rec_scale..rec_scale))
-                    .collect()
-            })
-            .collect();
-
-        let bias = vec![0.0; units];
-        let tau_weights = (0..units).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let tau_weights = (0..units).map(|_| rng.random_range(-0.5..0.5)).collect();
         let tau_bias = vec![config.tau_base.ln(); units];
 
         LtcCell {
             config,
             w_in,
             w_rec,
-            bias,
             tau_weights,
             tau_bias,
             input_dim,
@@ -156,7 +191,7 @@ impl LtcCell {
 
     /// Computes the input-dependent time constant for each unit.
     ///
-    /// τ(I) = tau_min + (tau_max - tau_min) * sigmoid(tau_weights * |I| + tau_bias)
+    /// tau(I) = tau_min + (tau_max - tau_min) * sigmoid(tau_weights * |I| + tau_bias)
     fn compute_tau(&self, input: &[f64]) -> Vec<f64> {
         let input_magnitude: f64 = input.iter().map(|x| x.abs()).sum();
 
@@ -170,30 +205,16 @@ impl LtcCell {
             .collect()
     }
 
-    /// Computes the pre-activation: W_in * input + W_rec * state + bias
-    fn pre_activation(&self, state: &[f64], input: &[f64]) -> Vec<f64> {
-        let units = self.config.units;
-        let mut result = self.bias.clone();
-
-        // Input contribution: W_in * input
-        for (i, &inp) in input.iter().enumerate() {
-            if i < self.w_in.len() {
-                for j in 0..units {
-                    result[j] += self.w_in[i][j] * inp;
-                }
-            }
-        }
-
-        // Recurrent contribution: W_rec * state
-        for (i, &s) in state.iter().enumerate() {
-            if i < self.w_rec.len() {
-                for j in 0..units {
-                    result[j] += self.w_rec[i][j] * s;
-                }
-            }
-        }
-
-        result
+    /// Computes the pre-activation: `W_in * input + W_rec * state + bias`.
+    ///
+    /// The cell bias is carried by `w_in` (`w_rec`'s bias is zero), so it is added exactly
+    /// once. `W_in * input + bias` comes from the shared layer's `.dot()`; the recurrent
+    /// `W_rec * state` term is accumulated in place to avoid an extra allocation (and the
+    /// no-op zero-bias add) in the RK4 hot path.
+    fn pre_activation(&self, state: &[f64], input: &[f64]) -> ndarray::Array1<f64> {
+        let mut pre = self.w_in.forward_arr(ArrayView1::from(input));
+        pre += &self.w_rec.weights.dot(&ArrayView1::from(state));
+        pre
     }
 
     /// Computes the derivative dx/dt for the LTC dynamics.
@@ -212,7 +233,10 @@ impl LtcCell {
 
     /// Performs one forward pass using ODE integration.
     ///
-    /// Integrates the LTC ODE from t=0 to t=1 (one logical timestep).
+    /// Integrates the LTC ODE over `t` in `[0, 1]` (one logical timestep) with exactly
+    /// `config.ode_unfolds` fixed RK4 sub-steps of size `dt = 1.0 / ode_unfolds`, applying
+    /// [`RungeKutta4::step`] directly. There is no adaptive stepping and no error path to
+    /// swallow: `ode_unfolds` is the single source of truth for integration effort.
     pub fn forward(&self, state: &[f64], input: &[f64]) -> Vec<f64> {
         let system = LtcOdeSystem {
             cell: self,
@@ -220,13 +244,18 @@ impl LtcCell {
         };
 
         let solver = RungeKutta4;
-        let config = SolverConfig::new(self.config.ode_step);
+        // `ode_unfolds` must be >= 1 (validated at config-build time in section 1f); guard
+        // defensively here so a degenerate config can never divide by zero.
+        let unfolds = self.config.ode_unfolds.max(1);
+        let dt = 1.0 / unfolds as f64;
 
-        let result = solver
-            .integrate(&system, state.to_vec(), input, 0.0, 1.0, &config)
-            .unwrap_or_else(|_| OdeState::new(state.to_vec()));
+        let mut ode_state = OdeState::new(state.to_vec());
+        for _ in 0..unfolds {
+            solver.step(&system, &mut ode_state, input, dt);
+            ode_state.time += dt;
+        }
 
-        result.values
+        ode_state.values
     }
 
     /// Processes a sequence of inputs.
@@ -271,77 +300,36 @@ impl<'a> OdeSystem for LtcOdeSystem<'a> {
 pub struct LtcNetwork {
     /// The LTC cell
     pub cell: LtcCell,
-    /// Output projection weights [units x output_dim]
-    pub w_out: Vec<Vec<f64>>,
-    /// Output bias [output_dim]
-    pub b_out: Vec<f64>,
-    /// Output dimension
-    output_dim: usize,
+    /// Output projection (`units -> output_dim`), replacing the former `w_out`/`b_out` fields.
+    output_layer: DenseLayer,
 }
 
 impl LtcNetwork {
     /// Creates a new LTC network.
     pub fn new(input_dim: usize, hidden_units: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
-        let config = LtcConfig::new(hidden_units);
-        let cell = LtcCell::new(input_dim, config);
-
-        // Xavier initialization for output weights
-        let out_scale = (2.0 / (hidden_units + output_dim) as f64).sqrt();
-        let w_out: Vec<Vec<f64>> = (0..hidden_units)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-out_scale..out_scale))
-                    .collect()
-            })
-            .collect();
-
-        let b_out = vec![0.0; output_dim];
-
-        LtcNetwork {
-            cell,
-            w_out,
-            b_out,
-            output_dim,
-        }
+        Self::with_config(input_dim, output_dim, LtcConfig::new(hidden_units))
     }
 
     /// Creates a new LTC network with custom configuration.
+    ///
+    /// A single [`StdRng`] (seeded from `config.seed`, or from entropy when unseeded) is
+    /// threaded through the cell and then the output projection, so a given seed yields a
+    /// byte-identical network.
     pub fn with_config(input_dim: usize, output_dim: usize, config: LtcConfig) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_os_rng(),
+        };
         let hidden_units = config.units;
-        let cell = LtcCell::new(input_dim, config);
+        let cell = LtcCell::with_rng(input_dim, config, &mut rng);
+        let output_layer = DenseLayer::new(hidden_units, output_dim, &mut rng);
 
-        let out_scale = (2.0 / (hidden_units + output_dim) as f64).sqrt();
-        let w_out: Vec<Vec<f64>> = (0..hidden_units)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-out_scale..out_scale))
-                    .collect()
-            })
-            .collect();
-
-        let b_out = vec![0.0; output_dim];
-
-        LtcNetwork {
-            cell,
-            w_out,
-            b_out,
-            output_dim,
-        }
+        LtcNetwork { cell, output_layer }
     }
 
     /// Projects hidden state to output.
     fn project_output(&self, hidden: &[f64]) -> Vec<f64> {
-        let mut output = self.b_out.clone();
-        for (i, &h) in hidden.iter().enumerate() {
-            if i < self.w_out.len() {
-                for j in 0..self.output_dim {
-                    output[j] += self.w_out[i][j] * h;
-                }
-            }
-        }
-        output
+        self.output_layer.forward(hidden)
     }
 
     /// Processes a single input and returns output.
@@ -367,7 +355,7 @@ impl LtcNetwork {
 
     /// Returns the output dimension.
     pub fn output_dim(&self) -> usize {
-        self.output_dim
+        self.output_layer.output_dim()
     }
 
     /// Returns the hidden dimension.
@@ -406,16 +394,40 @@ impl LtcBuilder {
         self
     }
 
-    /// Sets the ODE integration parameters.
-    pub fn ode_params(mut self, step: f64, unfolds: usize) -> Self {
-        self.config.ode_step = step;
+    /// Sets the number of RK4 sub-steps used to integrate one logical timestep.
+    pub fn ode_unfolds(mut self, unfolds: usize) -> Self {
         self.config.ode_unfolds = unfolds;
         self
     }
 
+    /// Sets the seed for reproducible random initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
+        self
+    }
+
     /// Builds the LTC network.
+    ///
+    /// # Panics
+    /// Panics with the validation message if the configuration is invalid. Use
+    /// [`try_build`](Self::try_build) for a non-panicking variant.
     pub fn build(self) -> LtcNetwork {
-        LtcNetwork::with_config(self.input_dim, self.output_dim, self.config)
+        self.try_build()
+            .unwrap_or_else(|e| panic!("invalid LtcConfig: {e}"))
+    }
+
+    /// Builds the LTC network, returning an error instead of panicking on an invalid
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns the [`LtcConfig::validate`] error if the configuration is invalid.
+    pub fn try_build(self) -> Result<LtcNetwork> {
+        self.config.validate()?;
+        Ok(LtcNetwork::with_config(
+            self.input_dim,
+            self.output_dim,
+            self.config,
+        ))
     }
 }
 
@@ -435,14 +447,34 @@ mod tests {
         let config = LtcConfig::new(32)
             .with_tau_range(0.5, 5.0)
             .with_tau_base(2.0)
-            .with_ode_params(0.05, 10);
+            .with_ode_unfolds(10);
 
         assert_eq!(config.units, 32);
         assert_eq!(config.tau_min, 0.5);
         assert_eq!(config.tau_max, 5.0);
         assert_eq!(config.tau_base, 2.0);
-        assert_eq!(config.ode_step, 0.05);
         assert_eq!(config.ode_unfolds, 10);
+    }
+
+    #[test]
+    fn test_ltc_config_validate() {
+        assert!(LtcConfig::new(16).validate().is_ok());
+        assert!(LtcConfig::new(0).validate().is_err());
+        assert!(LtcConfig::new(16)
+            .with_tau_range(0.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(LtcConfig::new(16)
+            .with_tau_range(5.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(LtcConfig::new(16).with_ode_unfolds(0).validate().is_err());
+    }
+
+    #[test]
+    fn test_ltc_builder_try_build() {
+        assert!(LtcBuilder::new(2, 1).hidden_units(8).try_build().is_ok());
+        assert!(LtcBuilder::new(2, 1).ode_unfolds(0).try_build().is_err());
     }
 
     #[test]
@@ -452,10 +484,10 @@ mod tests {
 
         assert_eq!(cell.units(), 16);
         assert_eq!(cell.input_dim(), 4);
-        assert_eq!(cell.w_in.len(), 4);
-        assert_eq!(cell.w_in[0].len(), 16);
-        assert_eq!(cell.w_rec.len(), 16);
-        assert_eq!(cell.w_rec[0].len(), 16);
+        assert_eq!(cell.w_in.input_dim(), 4);
+        assert_eq!(cell.w_in.output_dim(), 16);
+        assert_eq!(cell.w_rec.input_dim(), 16);
+        assert_eq!(cell.w_rec.output_dim(), 16);
     }
 
     #[test]
@@ -465,14 +497,14 @@ mod tests {
 
         let tau = cell.compute_tau(&[0.0, 0.0]);
         for &t in &tau {
-            assert!(t >= 0.1 && t <= 10.0);
+            assert!((0.1..=10.0).contains(&t));
         }
 
         // Higher input should affect tau
         let tau_high = cell.compute_tau(&[10.0, 10.0]);
         // Just verify it's in range (actual direction depends on weights)
         for &t in &tau_high {
-            assert!(t >= 0.1 && t <= 10.0);
+            assert!((0.1..=10.0).contains(&t));
         }
     }
 
@@ -551,11 +583,53 @@ mod tests {
         let network = LtcBuilder::new(4, 2)
             .hidden_units(32)
             .tau_range(0.5, 5.0)
-            .ode_params(0.05, 8)
+            .ode_unfolds(8)
             .build();
 
         assert_eq!(network.hidden_dim(), 32);
         assert_eq!(network.output_dim(), 2);
+    }
+
+    #[test]
+    fn test_ltc_ode_unfolds_effect_and_convergence() {
+        // Build one cell, then clone it and vary only `ode_unfolds` so all three cells
+        // share identical weights. A coarser integration (fewer unfolds) must give a
+        // measurably different result, and refining the integration must converge toward
+        // the finest reference (unfolds = 32). Small time constants are used so that the
+        // dynamics are fast enough for the step count to matter over the [0, 1] window.
+        let config = LtcConfig::new(16)
+            .with_tau_range(0.2, 0.6)
+            .with_tau_base(0.3);
+        let cell1 = LtcCell::new(2, config.with_ode_unfolds(1));
+        let mut cell8 = cell1.clone();
+        cell8.config.ode_unfolds = 8;
+        let mut cell32 = cell1.clone();
+        cell32.config.ode_unfolds = 32;
+
+        let state = cell1.initial_state();
+        let input = vec![2.0, -2.0];
+
+        let out1 = cell1.forward(&state, &input);
+        let out8 = cell8.forward(&state, &input);
+        let out32 = cell32.forward(&state, &input);
+
+        let sq_err = |a: &[f64], b: &[f64]| -> f64 {
+            a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
+        };
+
+        let err_1 = sq_err(&out1, &out32);
+        let err_8 = sq_err(&out8, &out32);
+
+        // unfolds = 1 must differ from the fine reference.
+        assert!(
+            err_1 > 1e-9,
+            "unfolds=1 should differ from unfolds=32 (err = {err_1})"
+        );
+        // Refining the integration converges: unfolds = 8 is closer than unfolds = 1.
+        assert!(
+            err_8 < err_1,
+            "unfolds=8 should be closer to unfolds=32 than unfolds=1 ({err_8} !< {err_1})"
+        );
     }
 
     #[test]
@@ -584,6 +658,35 @@ mod tests {
 
         assert_eq!(network.hidden_dim(), restored.hidden_dim());
         assert_eq!(network.output_dim(), restored.output_dim());
+    }
+
+    #[test]
+    fn test_ltc_seed_reproducible() {
+        // Same seed → byte-identical serialized network (single RNG threaded through the
+        // cell and the output projection).
+        let a = LtcBuilder::new(3, 2).hidden_units(16).seed(7).build();
+        let b = LtcBuilder::new(3, 2).hidden_units(16).seed(7).build();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_ltc_seed_differs() {
+        let a = LtcBuilder::new(3, 2).hidden_units(16).seed(7).build();
+        let b = LtcBuilder::new(3, 2).hidden_units(16).seed(8).build();
+        assert_ne!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_ltc_unseeded_still_works() {
+        let net = LtcNetwork::new(2, 8, 1);
+        assert_eq!(net.hidden_dim(), 8);
+        assert_eq!(net.output_dim(), 1);
     }
 
     #[test]

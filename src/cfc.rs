@@ -1,24 +1,44 @@
 // src/cfc.rs
 //! Closed-form Continuous-depth (CfC) neural network implementation.
 //!
-//! CfC networks are a variant of Liquid Time-Constant networks that use a closed-form
-//! solution instead of numerical ODE integration. This provides significant computational
-//! speedup while maintaining the expressive power of continuous-time models.
+//! CfC networks are a variant of Liquid Time-Constant networks that replace numerical
+//! ODE integration with a closed-form update, providing significant computational speedup
+//! while retaining the expressive power of continuous-time models.
 //!
 //! Based on "Closed-form Continuous-Time Neural Networks" (Hasani et al., 2022).
 //!
-//! The key insight is that the LTC ODE:
-//! ```text
-//! τ * dx/dt = -x + f(Wx + b)
-//! ```
+//! This module supports two update modes, selected by [`CfcConfig::no_gate`]:
 //!
-//! Has a closed-form solution when f is approximated appropriately:
-//! ```text
-//! x(t+Δt) = x(t) * exp(-Δt/τ) + (1 - exp(-Δt/τ)) * f(Wx + b)
-//! ```
+//! * **Gated (default, `no_gate = false`).** The reference CfC formulation. A shared
+//!   backbone produces features `z = backbone([state, input])`, from which two candidate
+//!   heads and a time-dependent interpolation gate are derived:
+//!   ```text
+//!   ff1      = tanh(W1 z + b1)
+//!   ff2      = tanh(W2 z + b2)
+//!   t_a      = Wa z + ba,   t_b = Wb z + bb
+//!   t_interp = sigmoid(t_a * dt + t_b)                    (elementwise)
+//!   x_new    = ff1 * (1 - t_interp) + t_interp * ff2      (elementwise)
+//!   ```
+//!   Because `x_new` is a convex combination of two `tanh` heads, it is bounded in
+//!   `[-1, 1]`.
+//!
+//! * **Decay (`no_gate = true`).** The pure exponential-decay closed form, equivalent to
+//!   an LTC neuron solved in closed form:
+//!   ```text
+//!   x(t+dt) = x(t) * exp(-dt/tau) + (1 - exp(-dt/tau)) * f(z)
+//!   ```
+//!   using an input-dependent time constant `tau` and `f(z) = tanh(W z + b)`.
+//!
+//! The decay-mode layers (`ff_projection`, `tau_layer`) and the gated-mode heads
+//! (`ff1`, `ff2`, `time_a`, `time_b`) are all constructed unconditionally so that
+//! serialization is mode-independent; only the active mode's layers are evaluated.
 
 use crate::activation::{sigmoid, tanh};
-use rand::{thread_rng, Rng};
+use crate::error::{LnnError, Result};
+use crate::layers::DenseLayer;
+use ndarray::Array1;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for CfC layers.
@@ -38,14 +58,22 @@ pub struct CfcConfig {
     pub backbone_layers: usize,
     /// Units per backbone layer
     pub backbone_units: usize,
+    /// Optional seed for reproducible random initialization. `Some(seed)` seeds a `StdRng`
+    /// with `seed`; `None` seeds from entropy.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 /// Activation function for the backbone network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackboneActivation {
+    /// Hyperbolic tangent, mapping to `(-1, 1)`.
     Tanh,
+    /// Rectified linear unit, `max(0, x)`.
     ReLU,
+    /// Sigmoid-weighted linear unit (a.k.a. swish), `x * sigmoid(x)`.
     SiLU,
+    /// Gaussian error linear unit (tanh approximation).
     GELU,
 }
 
@@ -62,6 +90,40 @@ impl BackboneActivation {
             }
         }
     }
+
+    /// Returns the derivative `d apply(x) / dx` evaluated at the pre-activation `x`.
+    ///
+    /// This is required for backpropagation through the CfC backbone (see
+    /// [`crate::train_cfc`]). The closed forms are:
+    ///
+    /// * `Tanh`: `1 - tanh(x)^2`
+    /// * `ReLU`: `1` if `x > 0`, else `0` (subgradient `0` at the kink)
+    /// * `SiLU`: `sigmoid(x) * (1 + x * (1 - sigmoid(x)))`
+    /// * `GELU` (approx `x * sigmoid(1.702 x)`):
+    ///   `sigmoid(1.702 x) + 1.702 x * sigmoid(1.702 x) * (1 - sigmoid(1.702 x))`
+    pub fn derivative(&self, x: f64) -> f64 {
+        match self {
+            BackboneActivation::Tanh => {
+                let t = x.tanh();
+                1.0 - t * t
+            }
+            BackboneActivation::ReLU => {
+                if x > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            BackboneActivation::SiLU => {
+                let s = sigmoid(x);
+                s * (1.0 + x * (1.0 - s))
+            }
+            BackboneActivation::GELU => {
+                let s = sigmoid(1.702 * x);
+                s + 1.702 * x * s * (1.0 - s)
+            }
+        }
+    }
 }
 
 impl Default for CfcConfig {
@@ -74,6 +136,7 @@ impl Default for CfcConfig {
             backbone_activation: BackboneActivation::SiLU,
             backbone_layers: 2,
             backbone_units: 64,
+            seed: None,
         }
     }
 }
@@ -113,52 +176,39 @@ impl CfcConfig {
         self.backbone_units = units;
         self
     }
-}
 
-/// Dense layer for the backbone network.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DenseLayer {
-    weights: Vec<Vec<f64>>,
-    bias: Vec<f64>,
-    input_dim: usize,
-    output_dim: usize,
-}
-
-impl DenseLayer {
-    fn new(input_dim: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
-        let scale = (2.0 / (input_dim + output_dim) as f64).sqrt();
-
-        let weights: Vec<Vec<f64>> = (0..input_dim)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-scale..scale))
-                    .collect()
-            })
-            .collect();
-
-        let bias = vec![0.0; output_dim];
-
-        DenseLayer {
-            weights,
-            bias,
-            input_dim,
-            output_dim,
-        }
+    /// Sets the seed for reproducible random initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
     }
 
-    fn forward(&self, input: &[f64]) -> Vec<f64> {
-        let mut output = self.bias.clone();
-        for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for j in 0..self.output_dim {
-                output[j] += self.weights[i][j] * inp;
-            }
+    /// Validates the configuration.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::Configuration`] if `units < 1`, `tau_min <= 0`,
+    /// `tau_min > tau_max`, or `backbone_layers < 1`.
+    pub fn validate(&self) -> Result<()> {
+        if self.units < 1 {
+            return Err(LnnError::configuration("units must be >= 1"));
         }
-        output
+        if self.tau_min <= 0.0 {
+            return Err(LnnError::configuration("tau_min must be > 0"));
+        }
+        if self.tau_min > self.tau_max {
+            return Err(LnnError::configuration("tau_min must be <= tau_max"));
+        }
+        if self.backbone_layers < 1 {
+            return Err(LnnError::configuration("backbone_layers must be >= 1"));
+        }
+        Ok(())
     }
 }
 
 /// Backbone MLP network that processes concatenated [state, input].
+///
+/// Layers are the shared [`DenseLayer`]; the forward pass runs entirely on
+/// [`ndarray::Array1`] so each layer is an `.dot()` matrix-vector product.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Backbone {
     layers: Vec<DenseLayer>,
@@ -171,60 +221,94 @@ impl Backbone {
         hidden_units: usize,
         num_layers: usize,
         activation: BackboneActivation,
+        rng: &mut StdRng,
     ) -> Self {
         let mut layers = Vec::new();
 
         // First layer
-        layers.push(DenseLayer::new(input_dim, hidden_units));
+        layers.push(DenseLayer::new(input_dim, hidden_units, rng));
 
         // Hidden layers
         for _ in 1..num_layers {
-            layers.push(DenseLayer::new(hidden_units, hidden_units));
+            layers.push(DenseLayer::new(hidden_units, hidden_units, rng));
         }
 
         Backbone { layers, activation }
     }
 
-    fn forward(&self, input: &[f64]) -> Vec<f64> {
-        let mut x = input.to_vec();
+    /// Runs the backbone on an [`Array1`] input, applying the activation to every layer but
+    /// the last.
+    fn forward_arr(&self, input: Array1<f64>) -> Array1<f64> {
+        let mut x = input;
+        let last = self.layers.len() - 1;
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x);
-            // Apply activation to all but the last layer
-            if i < self.layers.len() - 1 {
-                x = x.iter().map(|&v| self.activation.apply(v)).collect();
+            x = layer.forward_arr(x.view());
+            if i < last {
+                x.mapv_inplace(|v| self.activation.apply(v));
             }
         }
         x
     }
 
     fn output_dim(&self) -> usize {
-        self.layers.last().map(|l| l.output_dim).unwrap_or(0)
+        self.layers.last().map(|l| l.output_dim()).unwrap_or(0)
     }
 }
 
 /// CfC Cell implementing the closed-form continuous-time dynamics.
 ///
-/// The cell computes:
-/// 1. Backbone features from [state, input]
-/// 2. Time constants τ (input-dependent)
-/// 3. New state using the closed-form solution
+/// The cell computes backbone features `z` from the concatenated `[state, input]` vector
+/// and then updates the state using one of two modes (see the [module docs](crate::cfc)):
+///
+/// * gated (`no_gate = false`): `x_new = ff1 * (1 - t_interp) + t_interp * ff2`,
+/// * decay (`no_gate = true`): the exponential-decay closed form using an input-dependent
+///   time constant.
+///
+/// Both modes' layers are constructed unconditionally so serialization is mode-independent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CfcCell {
     /// Configuration
     pub config: CfcConfig,
     /// Backbone network
     backbone: Backbone,
-    /// Projection to state update (ff from backbone to state)
+    /// Decay-mode: projection from backbone features to the target state `f(z)`
     ff_projection: DenseLayer,
-    /// Time constant computation weights
+    /// Decay-mode: input-dependent time-constant logits
     tau_layer: DenseLayer,
+    /// Gated-mode: first candidate head (pre-`tanh`)
+    ff1: DenseLayer,
+    /// Gated-mode: second candidate head (pre-`tanh`)
+    ff2: DenseLayer,
+    /// Gated-mode: time-gate slope term `t_a`
+    time_a: DenseLayer,
+    /// Gated-mode: time-gate offset term `t_b`
+    time_b: DenseLayer,
     /// Input dimension
     input_dim: usize,
 }
 
 impl CfcCell {
     /// Creates a new CfC cell.
+    ///
+    /// All layers for both the gated and decay modes are constructed; only the layers of
+    /// the mode selected by [`CfcConfig::no_gate`] are evaluated during [`CfcCell::forward`].
+    ///
+    /// This self-contained constructor creates its own [`StdRng`] from `config.seed` (or
+    /// from entropy when unseeded). Full networks use [`CfcCell::with_rng`] so the cell and
+    /// output projection share one generator.
     pub fn new(input_dim: usize, config: CfcConfig) -> Self {
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_os_rng(),
+        };
+        Self::with_rng(input_dim, config, &mut rng)
+    }
+
+    /// Creates a new CfC cell drawing all weights from the supplied generator.
+    ///
+    /// The layer construction order (backbone, then decay-mode layers, then the gated-mode
+    /// heads) is fixed, so a given generator state produces a deterministic cell.
+    pub fn with_rng(input_dim: usize, config: CfcConfig, rng: &mut StdRng) -> Self {
         let state_input_dim = config.units + input_dim;
 
         let backbone = Backbone::new(
@@ -232,21 +316,31 @@ impl CfcCell {
             config.backbone_units,
             config.backbone_layers,
             config.backbone_activation,
+            rng,
         );
 
         let backbone_out_dim = backbone.output_dim();
+        let units = config.units;
 
-        // Projection from backbone to state update
-        let ff_projection = DenseLayer::new(backbone_out_dim, config.units);
+        // Decay-mode layers.
+        let ff_projection = DenseLayer::new(backbone_out_dim, units, rng);
+        let tau_layer = DenseLayer::new(backbone_out_dim, units, rng);
 
-        // Time constant layer
-        let tau_layer = DenseLayer::new(backbone_out_dim, config.units);
+        // Gated-mode heads.
+        let ff1 = DenseLayer::new(backbone_out_dim, units, rng);
+        let ff2 = DenseLayer::new(backbone_out_dim, units, rng);
+        let time_a = DenseLayer::new(backbone_out_dim, units, rng);
+        let time_b = DenseLayer::new(backbone_out_dim, units, rng);
 
         CfcCell {
             config,
             backbone,
             ff_projection,
             tau_layer,
+            ff1,
+            ff2,
+            time_a,
+            time_b,
             input_dim,
         }
     }
@@ -262,54 +356,53 @@ impl CfcCell {
     }
 
     /// Computes time constants from backbone features.
-    fn compute_tau(&self, backbone_features: &[f64]) -> Vec<f64> {
-        let tau_logits = self.tau_layer.forward(backbone_features);
-        tau_logits
-            .iter()
-            .map(|&logit| {
-                self.config.tau_min + (self.config.tau_max - self.config.tau_min) * sigmoid(logit)
-            })
-            .collect()
+    fn compute_tau(&self, backbone_features: &Array1<f64>) -> Array1<f64> {
+        let (tau_min, tau_max) = (self.config.tau_min, self.config.tau_max);
+        self.tau_layer
+            .forward_arr(backbone_features.view())
+            .mapv(|logit| tau_min + (tau_max - tau_min) * sigmoid(logit))
     }
 
-    /// Performs one forward pass using the closed-form solution.
+    /// Performs one forward pass.
     ///
-    /// x(t+1) = x(t) * exp(-1/τ) + (1 - exp(-1/τ)) * f(backbone([x, input]))
+    /// In gated mode (`no_gate = false`) computes
+    /// `x_new = ff1 * (1 - t_interp) + t_interp * ff2`, where
+    /// `t_interp = sigmoid(t_a * dt + t_b)` and `ff1`/`ff2` are `tanh` heads.
+    ///
+    /// In decay mode (`no_gate = true`) computes the exponential-decay closed form
+    /// `x_new = x * exp(-dt/tau) + (1 - exp(-dt/tau)) * f(z)`.
     pub fn forward(&self, state: &[f64], input: &[f64], dt: f64) -> Vec<f64> {
-        // Concatenate state and input for backbone
-        let mut combined = state.to_vec();
+        // Concatenate state and input for the backbone.
+        let mut combined = Vec::with_capacity(state.len() + input.len());
+        combined.extend_from_slice(state);
         combined.extend_from_slice(input);
 
-        // Compute backbone features
-        let features = self.backbone.forward(&combined);
-
-        // Compute time constants
-        let tau = self.compute_tau(&features);
-
-        // Compute target state (what we'd converge to)
-        let ff_raw = self.ff_projection.forward(&features);
-        let ff: Vec<f64> = ff_raw.iter().map(|&x| tanh(x)).collect();
+        // Compute backbone features z = backbone([state, input]).
+        let features = self.backbone.forward_arr(Array1::from(combined));
 
         if self.config.no_gate {
-            // Simple version: direct interpolation
-            state
-                .iter()
-                .zip(ff.iter())
-                .zip(tau.iter())
-                .map(|((&x, &f), &t)| {
-                    let decay = (-dt / t).exp();
-                    x * decay + (1.0 - decay) * f
+            // Decay (pure) mode: closed-form exponential decay toward f(z) = tanh(W z + b).
+            let tau = self.compute_tau(&features);
+            let ff = self.ff_projection.forward_arr(features.view()).mapv(tanh);
+
+            (0..self.config.units)
+                .map(|i| {
+                    let decay = (-dt / tau[i]).exp();
+                    state[i] * decay + (1.0 - decay) * ff[i]
                 })
                 .collect()
         } else {
-            // Full version with additional gating
-            let decay: Vec<f64> = tau.iter().map(|&t| (-dt / t).exp()).collect();
+            // Gated (default) mode: interpolate two tanh heads with a time-dependent gate.
+            let ff1 = self.ff1.forward_arr(features.view()).mapv(tanh);
+            let ff2 = self.ff2.forward_arr(features.view()).mapv(tanh);
+            let t_a = self.time_a.forward_arr(features.view());
+            let t_b = self.time_b.forward_arr(features.view());
 
-            state
-                .iter()
-                .zip(ff.iter())
-                .zip(decay.iter())
-                .map(|((&x, &f), &d)| x * d + (1.0 - d) * f)
+            (0..self.config.units)
+                .map(|i| {
+                    let t_interp = sigmoid(t_a[i] * dt + t_b[i]);
+                    ff1[i] * (1.0 - t_interp) + t_interp * ff2[i]
+                })
                 .collect()
         }
     }
@@ -352,10 +445,18 @@ impl CfcNetwork {
     }
 
     /// Creates a new CfC network with custom configuration.
+    ///
+    /// A single [`StdRng`] (seeded from `config.seed`, or from entropy when unseeded) is
+    /// threaded through the cell and then the output projection, so a given seed yields a
+    /// byte-identical network.
     pub fn with_config(input_dim: usize, output_dim: usize, config: CfcConfig) -> Self {
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_os_rng(),
+        };
         let hidden_units = config.units;
-        let cell = CfcCell::new(input_dim, config);
-        let output_layer = DenseLayer::new(hidden_units, output_dim);
+        let cell = CfcCell::with_rng(input_dim, config, &mut rng);
+        let output_layer = DenseLayer::new(hidden_units, output_dim, &mut rng);
 
         CfcNetwork {
             cell,
@@ -377,7 +478,7 @@ impl CfcNetwork {
 
     /// Returns the output dimension.
     pub fn output_dim(&self) -> usize {
-        self.output_layer.output_dim
+        self.output_layer.output_dim()
     }
 
     /// Processes a single input.
@@ -460,9 +561,30 @@ impl CfcBuilder {
         self
     }
 
+    /// Sets the seed for reproducible random initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
+        self
+    }
+
     /// Builds the CfC network.
+    ///
+    /// # Panics
+    /// Panics with the validation message if the configuration is invalid. Use
+    /// [`try_build`](Self::try_build) for a non-panicking variant.
     pub fn build(self) -> CfcNetwork {
-        CfcNetwork::with_config(self.input_dim, self.output_dim, self.config).with_dt(self.dt)
+        self.try_build()
+            .unwrap_or_else(|e| panic!("invalid CfcConfig: {e}"))
+    }
+
+    /// Builds the CfC network, returning an error instead of panicking on an invalid
+    /// configuration.
+    ///
+    /// # Errors
+    /// Returns the [`CfcConfig::validate`] error if the configuration is invalid.
+    pub fn try_build(self) -> Result<CfcNetwork> {
+        self.config.validate()?;
+        Ok(CfcNetwork::with_config(self.input_dim, self.output_dim, self.config).with_dt(self.dt))
     }
 }
 
@@ -495,6 +617,27 @@ mod tests {
     }
 
     #[test]
+    fn test_cfc_config_validate() {
+        assert!(CfcConfig::new(16).validate().is_ok());
+        assert!(CfcConfig::new(0).validate().is_err());
+        assert!(CfcConfig::new(16)
+            .with_tau_range(0.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(CfcConfig::new(16)
+            .with_tau_range(5.0, 1.0)
+            .validate()
+            .is_err());
+        assert!(CfcConfig::new(16).with_backbone(0, 16).validate().is_err());
+    }
+
+    #[test]
+    fn test_cfc_builder_try_build() {
+        assert!(CfcBuilder::new(2, 1).hidden_units(8).try_build().is_ok());
+        assert!(CfcBuilder::new(2, 1).backbone(0, 8).try_build().is_err());
+    }
+
+    #[test]
     fn test_backbone_activation() {
         assert_relative_eq!(BackboneActivation::Tanh.apply(0.0), 0.0, epsilon = 1e-10);
         assert_eq!(BackboneActivation::ReLU.apply(-1.0), 0.0);
@@ -504,19 +647,61 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_layer() {
-        let layer = DenseLayer::new(3, 4);
-        assert_eq!(layer.input_dim, 3);
-        assert_eq!(layer.output_dim, 4);
+    fn test_backbone_activation_derivative_matches_finite_difference() {
+        // Every smooth activation's analytic derivative must match a central finite
+        // difference; ReLU is checked away from its kink.
+        let eps = 1e-6;
+        let activations = [
+            BackboneActivation::Tanh,
+            BackboneActivation::ReLU,
+            BackboneActivation::SiLU,
+            BackboneActivation::GELU,
+        ];
+        for act in activations {
+            for &x in &[-2.3, -1.0, -0.4, 0.4, 1.0, 2.3] {
+                let numeric = (act.apply(x + eps) - act.apply(x - eps)) / (2.0 * eps);
+                let analytic = act.derivative(x);
+                assert!(
+                    (numeric - analytic).abs() < 1e-5,
+                    "{:?} derivative mismatch at x={}: analytic={} numeric={}",
+                    act,
+                    x,
+                    analytic,
+                    numeric
+                );
+            }
+        }
+    }
 
-        let output = layer.forward(&[1.0, 0.5, 0.2]);
-        assert_eq!(output.len(), 4);
+    #[test]
+    fn test_backbone_activation_derivative_known_values() {
+        // Spot-check the closed forms the spec pins down.
+        assert_relative_eq!(
+            BackboneActivation::Tanh.derivative(0.0),
+            1.0,
+            epsilon = 1e-12
+        );
+        assert_eq!(BackboneActivation::ReLU.derivative(2.0), 1.0);
+        assert_eq!(BackboneActivation::ReLU.derivative(-2.0), 0.0);
+        // SiLU'(0) = sigmoid(0) * (1 + 0) = 0.5.
+        assert_relative_eq!(
+            BackboneActivation::SiLU.derivative(0.0),
+            0.5,
+            epsilon = 1e-12
+        );
+        // GELU'(0) = sigmoid(0) = 0.5.
+        assert_relative_eq!(
+            BackboneActivation::GELU.derivative(0.0),
+            0.5,
+            epsilon = 1e-12
+        );
     }
 
     #[test]
     fn test_backbone() {
-        let backbone = Backbone::new(10, 16, 2, BackboneActivation::SiLU);
-        let output = backbone.forward(&vec![0.5; 10]);
+        let mut rng = StdRng::seed_from_u64(0);
+        let backbone = Backbone::new(10, 16, 2, BackboneActivation::SiLU, &mut rng);
+        let output = backbone.forward_arr(Array1::from(vec![0.5; 10]));
         assert_eq!(output.len(), 16);
     }
 
@@ -688,12 +873,111 @@ mod tests {
         let mut combined = state.clone();
         combined.extend_from_slice(&input);
 
-        let features = cell.backbone.forward(&combined);
+        let features = cell.backbone.forward_arr(Array1::from(combined));
         let tau = cell.compute_tau(&features);
 
         // All time constants should be in range
         for &t in &tau {
-            assert!(t >= 0.1 && t <= 10.0, "tau {} out of range", t);
+            assert!((0.1..=10.0).contains(&t), "tau {} out of range", t);
+        }
+    }
+
+    #[test]
+    fn test_cfc_gated_vs_no_gate_differ() {
+        // Build one gated cell, then clone it and flip `no_gate` so both modes share
+        // identical weights (constructors are randomly initialized, so cloning is the
+        // only way to guarantee a fair comparison). The gated and decay updates read
+        // disjoint layers, so the sequences must differ.
+        let gated = CfcCell::new(2, CfcConfig::new(8));
+        assert!(!gated.config.no_gate);
+
+        let mut ungated = gated.clone();
+        ungated.config.no_gate = true;
+
+        let inputs = vec![vec![1.0, -0.5], vec![0.3, 0.7], vec![-1.0, 0.2]];
+        let gated_seq = gated.forward_sequence(&inputs, 1.0);
+        let ungated_seq = ungated.forward_sequence(&inputs, 1.0);
+
+        let differ = gated_seq
+            .iter()
+            .zip(ungated_seq.iter())
+            .flat_map(|(a, b)| a.iter().zip(b.iter()))
+            .any(|(&x, &y)| (x - y).abs() > 1e-9);
+
+        assert!(
+            differ,
+            "gated and no-gate modes should produce different sequences"
+        );
+    }
+
+    #[test]
+    fn test_cfc_gated_bounded() {
+        // The gated update is a convex combination of two tanh heads, so every state
+        // component must stay within [-1, 1] even for large, sustained inputs.
+        let cell = CfcCell::new(2, CfcConfig::new(8));
+        assert!(!cell.config.no_gate);
+
+        let inputs: Vec<Vec<f64>> = (0..50).map(|_| vec![10.0, -10.0]).collect();
+        let seq = cell.forward_sequence(&inputs, 1.0);
+
+        for state in &seq {
+            for &v in state {
+                assert!(
+                    (-1.0..=1.0).contains(&v),
+                    "gated state component {} out of [-1, 1]",
+                    v
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cfc_seed_reproducible() {
+        // Same seed → byte-identical serialized network (one RNG threaded through the
+        // backbone, both mode's layers, and the output projection).
+        let a = CfcBuilder::new(2, 1).hidden_units(8).seed(99).build();
+        let b = CfcBuilder::new(2, 1).hidden_units(8).seed(99).build();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_cfc_seed_differs() {
+        let a = CfcBuilder::new(2, 1).hidden_units(8).seed(99).build();
+        let b = CfcBuilder::new(2, 1).hidden_units(8).seed(100).build();
+        assert_ne!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_cfc_unseeded_still_works() {
+        let net = CfcNetwork::new(2, 8, 1);
+        assert_eq!(net.hidden_dim(), 8);
+        assert_eq!(net.output_dim(), 1);
+    }
+
+    #[test]
+    fn test_cfc_cell_serialization() {
+        // Round-trips must preserve every layer for both modes; JSON float encoding can
+        // shift the final ULP, so compare within a tight tolerance.
+        let cell = CfcCell::new(3, CfcConfig::new(8));
+
+        let json = serde_json::to_string(&cell).unwrap();
+        let restored: CfcCell = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(cell.units(), restored.units());
+        assert_eq!(cell.input_dim(), restored.input_dim());
+
+        let state = cell.initial_state();
+        let input = vec![0.5, -0.2, 0.1];
+        let before = cell.forward(&state, &input, 1.0);
+        let after = restored.forward(&state, &input, 1.0);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
         }
     }
 }

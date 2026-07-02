@@ -60,7 +60,7 @@ pub fn write_output_to_string(outputs: &[Vec<f64>]) -> Result<String> {
 
     let data = wtr
         .into_inner()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(String::from_utf8_lossy(&data).to_string())
 }

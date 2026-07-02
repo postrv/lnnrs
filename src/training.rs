@@ -24,7 +24,11 @@
 //! ```
 
 use crate::activation::tanh;
-use rand::{thread_rng, Rng};
+use crate::layers::DenseLayer;
+use crate::optim::{clip_grad_norm, Optimizer, Sgd};
+use ndarray::{Array1, Array2, ArrayView1};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for BPTT training.
@@ -34,12 +38,23 @@ pub struct BpttConfig {
     pub learning_rate: f64,
     /// Truncation length (how many timesteps to backprop through)
     pub truncation_length: usize,
-    /// Gradient clipping threshold
+    /// Global-norm gradient-clipping threshold.
+    ///
+    /// When `Some(max_norm)`, all of a model's gradient tensors are rescaled jointly (see
+    /// [`clip_grad_norm`]) so their combined L2 norm does not
+    /// exceed `max_norm`, applied once before the optimizer step. `None` disables clipping.
+    /// (This replaces the earlier per-element gradient clamping; the standalone
+    /// [`TrainableDense::update`] still clamps per element for backward compatibility.)
     pub gradient_clip: Option<f64>,
     /// L2 regularization coefficient
     pub l2_lambda: f64,
     /// Momentum coefficient
     pub momentum: f64,
+    /// Optional seed for reproducible weight initialization. `Some(seed)` seeds a `StdRng`
+    /// with `seed`; `None` seeds from entropy. Consumed by [`TrainableRnnBuilder::build`]
+    /// and [`TrainableRnn::with_seed`].
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for BpttConfig {
@@ -50,6 +65,7 @@ impl Default for BpttConfig {
             gradient_clip: Some(1.0),
             l2_lambda: 1e-4,
             momentum: 0.9,
+            seed: None,
         }
     }
 }
@@ -92,23 +108,32 @@ impl BpttConfig {
         self.momentum = momentum;
         self
     }
+
+    /// Sets the seed for reproducible weight initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
 }
 
 /// Simple dense layer with gradients for training.
+///
+/// Wraps the shared [`DenseLayer`] (parameters + Xavier init + `.dot()` forward) and adds the
+/// gradient and SGD-momentum buffers needed for BPTT. Weights are stored as
+/// `[output_dim, input_dim]` (the `DenseLayer` convention), so the accumulated gradient and
+/// momentum tensors share that shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainableDense {
-    /// Weights [input_dim x output_dim]
-    pub weights: Vec<Vec<f64>>,
-    /// Biases [output_dim]
-    pub bias: Vec<f64>,
-    /// Weight gradients (accumulated)
-    grad_weights: Vec<Vec<f64>>,
-    /// Bias gradients (accumulated)
-    grad_bias: Vec<f64>,
-    /// Weight momentum
-    momentum_weights: Vec<Vec<f64>>,
-    /// Bias momentum
-    momentum_bias: Vec<f64>,
+    /// Parameters (weights `[output_dim, input_dim]`, bias `[output_dim]`).
+    layer: DenseLayer,
+    /// Weight gradients (accumulated), shape `[output_dim, input_dim]`.
+    grad_weights: Array2<f64>,
+    /// Bias gradients (accumulated), shape `[output_dim]`.
+    grad_bias: Array1<f64>,
+    /// Weight momentum, shape `[output_dim, input_dim]`.
+    momentum_weights: Array2<f64>,
+    /// Bias momentum, shape `[output_dim]`.
+    momentum_bias: Array1<f64>,
     /// Input dimension
     pub input_dim: usize,
     /// Output dimension
@@ -117,45 +142,41 @@ pub struct TrainableDense {
 
 impl TrainableDense {
     /// Creates a new trainable dense layer with random initialization.
+    ///
+    /// Self-contained convenience constructor: it seeds its own [`StdRng`] from entropy.
+    /// Seeded/reproducible construction goes through [`TrainableDense::with_rng`] so a whole
+    /// network can be derived from a single generator.
     pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
-        let scale = (2.0 / (input_dim + output_dim) as f64).sqrt();
+        let mut rng = StdRng::from_os_rng();
+        Self::with_rng(input_dim, output_dim, &mut rng)
+    }
 
-        let weights: Vec<Vec<f64>> = (0..input_dim)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-scale..scale))
-                    .collect()
-            })
-            .collect();
-
-        let bias = vec![0.0; output_dim];
-        let grad_weights = vec![vec![0.0; output_dim]; input_dim];
-        let grad_bias = vec![0.0; output_dim];
-        let momentum_weights = vec![vec![0.0; output_dim]; input_dim];
-        let momentum_bias = vec![0.0; output_dim];
-
+    /// Creates a new trainable dense layer drawing weights from the supplied generator.
+    pub fn with_rng(input_dim: usize, output_dim: usize, rng: &mut StdRng) -> Self {
         TrainableDense {
-            weights,
-            bias,
-            grad_weights,
-            grad_bias,
-            momentum_weights,
-            momentum_bias,
+            layer: DenseLayer::new(input_dim, output_dim, rng),
+            grad_weights: Array2::zeros((output_dim, input_dim)),
+            grad_bias: Array1::zeros(output_dim),
+            momentum_weights: Array2::zeros((output_dim, input_dim)),
+            momentum_bias: Array1::zeros(output_dim),
             input_dim,
             output_dim,
         }
     }
 
-    /// Forward pass: output = input @ weights + bias
+    /// Returns a reference to the weight matrix (`[output_dim, input_dim]`).
+    pub fn weights(&self) -> &Array2<f64> {
+        &self.layer.weights
+    }
+
+    /// Returns a reference to the bias vector (`[output_dim]`).
+    pub fn bias(&self) -> &Array1<f64> {
+        &self.layer.bias
+    }
+
+    /// Forward pass: `output = W x + b`.
     pub fn forward(&self, input: &[f64]) -> Vec<f64> {
-        let mut output = self.bias.clone();
-        for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for j in 0..self.output_dim {
-                output[j] += self.weights[i][j] * inp;
-            }
-        }
-        output
+        self.layer.forward(input)
     }
 
     /// Backward pass: computes gradients and returns input gradient.
@@ -167,75 +188,72 @@ impl TrainableDense {
     /// # Returns
     /// Gradient w.r.t. input
     pub fn backward(&mut self, input: &[f64], grad_output: &[f64]) -> Vec<f64> {
-        // Accumulate weight gradients: dL/dW = input^T @ grad_output
-        for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-                self.grad_weights[i][j] += inp * grad;
+        // Accumulate parameter gradients: dL/dW[j][i] = grad_output[j] * input[i].
+        for (j, &go) in grad_output.iter().enumerate() {
+            self.grad_bias[j] += go;
+            for (i, &xi) in input.iter().enumerate() {
+                self.grad_weights[[j, i]] += xi * go;
             }
         }
 
-        // Accumulate bias gradients
-        for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-            self.grad_bias[j] += grad;
-        }
-
-        // Compute input gradient: dL/dx = grad_output @ W^T
-        let mut grad_input = vec![0.0; self.input_dim];
-        for i in 0..self.input_dim {
-            for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-                grad_input[i] += self.weights[i][j] * grad;
-            }
-        }
-
-        grad_input
+        // Input gradient: dL/dx = W^T @ grad_output.
+        self.layer
+            .weights
+            .t()
+            .dot(&ArrayView1::from(grad_output))
+            .to_vec()
     }
 
     /// Applies accumulated gradients using SGD with momentum.
     pub fn update(&mut self, config: &BpttConfig) {
-        for i in 0..self.input_dim {
-            for j in 0..self.output_dim {
-                // Add L2 regularization
-                let grad = self.grad_weights[i][j] + config.l2_lambda * self.weights[i][j];
+        for j in 0..self.output_dim {
+            for i in 0..self.input_dim {
+                // Add L2 regularization.
+                let grad =
+                    self.grad_weights[[j, i]] + config.l2_lambda * self.layer.weights[[j, i]];
 
-                // Clip gradient
-                let clipped_grad = if let Some(clip) = config.gradient_clip {
-                    grad.clamp(-clip, clip)
-                } else {
-                    grad
+                // Clip gradient.
+                let clipped_grad = match config.gradient_clip {
+                    Some(clip) => grad.clamp(-clip, clip),
+                    None => grad,
                 };
 
-                // Apply momentum
-                self.momentum_weights[i][j] = config.momentum * self.momentum_weights[i][j]
+                // Apply momentum.
+                self.momentum_weights[[j, i]] = config.momentum * self.momentum_weights[[j, i]]
                     + config.learning_rate * clipped_grad;
 
-                // Update weight
-                self.weights[i][j] -= self.momentum_weights[i][j];
+                // Update weight.
+                self.layer.weights[[j, i]] -= self.momentum_weights[[j, i]];
             }
         }
 
         for j in 0..self.output_dim {
-            let grad = if let Some(clip) = config.gradient_clip {
-                self.grad_bias[j].clamp(-clip, clip)
-            } else {
-                self.grad_bias[j]
+            let grad = match config.gradient_clip {
+                Some(clip) => self.grad_bias[j].clamp(-clip, clip),
+                None => self.grad_bias[j],
             };
 
             self.momentum_bias[j] =
                 config.momentum * self.momentum_bias[j] + config.learning_rate * grad;
 
-            self.bias[j] -= self.momentum_bias[j];
+            self.layer.bias[j] -= self.momentum_bias[j];
         }
     }
 
     /// Zeros accumulated gradients.
     pub fn zero_grad(&mut self) {
-        for i in 0..self.input_dim {
-            for j in 0..self.output_dim {
-                self.grad_weights[i][j] = 0.0;
-            }
-        }
-        for j in 0..self.output_dim {
-            self.grad_bias[j] = 0.0;
+        self.grad_weights.fill(0.0);
+        self.grad_bias.fill(0.0);
+    }
+
+    /// Folds L2 regularization into the accumulated weight gradient
+    /// (`grad_weights += lambda * weights`); biases are left unregularized.
+    ///
+    /// Used by optimizer-driven training paths that clip and step outside of
+    /// [`Self::update`], so the L2 term is applied consistently before global-norm clipping.
+    pub fn fold_l2(&mut self, lambda: f64) {
+        if lambda != 0.0 {
+            self.grad_weights.scaled_add(lambda, &self.layer.weights);
         }
     }
 }
@@ -255,11 +273,19 @@ pub struct TrainableRnnCell {
 }
 
 impl TrainableRnnCell {
-    /// Creates a new trainable RNN cell.
+    /// Creates a new trainable RNN cell (RNG seeded from entropy).
     pub fn new(input_dim: usize, hidden_dim: usize) -> Self {
+        let mut rng = StdRng::from_os_rng();
+        Self::with_rng(input_dim, hidden_dim, &mut rng)
+    }
+
+    /// Creates a new trainable RNN cell drawing all weights from the supplied generator.
+    ///
+    /// The input and recurrent weight matrices are drawn in that fixed order from `rng`.
+    pub fn with_rng(input_dim: usize, hidden_dim: usize, rng: &mut StdRng) -> Self {
         TrainableRnnCell {
-            w_in: TrainableDense::new(input_dim, hidden_dim),
-            w_rec: TrainableDense::new(hidden_dim, hidden_dim),
+            w_in: TrainableDense::with_rng(input_dim, hidden_dim, rng),
+            w_rec: TrainableDense::with_rng(hidden_dim, hidden_dim, rng),
             hidden_dim,
         }
     }
@@ -343,6 +369,9 @@ pub struct TrainableRnn {
     pub output: TrainableDense,
     /// Training configuration
     pub config: BpttConfig,
+    /// SGD+momentum optimizer (state is not serialized).
+    #[serde(skip)]
+    optimizer: Sgd,
     /// Cached states for backward pass
     #[serde(skip)]
     cached_states: Vec<Vec<f64>>,
@@ -355,12 +384,37 @@ pub struct TrainableRnn {
 }
 
 impl TrainableRnn {
-    /// Creates a new trainable RNN.
+    /// Creates a new trainable RNN with weights seeded from entropy.
     pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
+        Self::with_seed(input_dim, hidden_dim, output_dim, None)
+    }
+
+    /// Creates a new trainable RNN with reproducible weight initialization.
+    ///
+    /// A single [`StdRng`] (seeded from `seed`, or from entropy when `None`) is threaded
+    /// through the recurrent cell and then the output projection, so a given seed produces a
+    /// byte-identical network. The seed is also recorded in [`Self::config`] (`config.seed`)
+    /// so the resulting network is self-describing.
+    pub fn with_seed(
+        input_dim: usize,
+        hidden_dim: usize,
+        output_dim: usize,
+        seed: Option<u64>,
+    ) -> Self {
+        let mut rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_os_rng(),
+        };
+        let config = BpttConfig {
+            seed,
+            ..BpttConfig::default()
+        };
+        let optimizer = Sgd::new(config.learning_rate, config.momentum);
         TrainableRnn {
-            cell: TrainableRnnCell::new(input_dim, hidden_dim),
-            output: TrainableDense::new(hidden_dim, output_dim),
-            config: BpttConfig::default(),
+            cell: TrainableRnnCell::with_rng(input_dim, hidden_dim, &mut rng),
+            output: TrainableDense::with_rng(hidden_dim, output_dim, &mut rng),
+            config,
+            optimizer,
             cached_states: Vec::new(),
             cached_pre_acts: Vec::new(),
             cached_inputs: Vec::new(),
@@ -461,9 +515,32 @@ impl TrainableRnn {
         // Backward pass
         self.backward(&grad_outputs);
 
-        // Update weights
-        self.cell.update(&self.config);
-        self.output.update(&self.config);
+        // Fold L2 regularization into weight gradients (matches the standalone update()).
+        let l2 = self.config.l2_lambda;
+        self.cell.w_in.fold_l2(l2);
+        self.cell.w_rec.fold_l2(l2);
+        self.output.fold_l2(l2);
+
+        // Global-norm gradient clipping across every tensor before the optimizer step.
+        if let Some(max_norm) = self.config.gradient_clip {
+            let mut grads: Vec<&mut [f64]> = vec![
+                self.cell.w_in.grad_weights.as_slice_mut().unwrap(),
+                self.cell.w_in.grad_bias.as_slice_mut().unwrap(),
+                self.cell.w_rec.grad_weights.as_slice_mut().unwrap(),
+                self.cell.w_rec.grad_bias.as_slice_mut().unwrap(),
+                self.output.grad_weights.as_slice_mut().unwrap(),
+                self.output.grad_bias.as_slice_mut().unwrap(),
+            ];
+            clip_grad_norm(&mut grads, max_norm);
+        }
+
+        // Update weights through the Optimizer trait (SGD + momentum by default).
+        self.optimizer.set_learning_rate(self.config.learning_rate);
+        self.optimizer.set_momentum(self.config.momentum);
+        let mut group = 0usize;
+        sgd_step_dense(&mut self.optimizer, &mut self.cell.w_in, &mut group);
+        sgd_step_dense(&mut self.optimizer, &mut self.cell.w_rec, &mut group);
+        sgd_step_dense(&mut self.optimizer, &mut self.output, &mut group);
 
         loss
     }
@@ -494,7 +571,40 @@ impl TrainableRnn {
     }
 }
 
-/// Computes MSE loss and gradients.
+/// Applies one SGD step to a trainable dense layer's weight and bias tensors via the
+/// [`Optimizer`] trait, advancing the `param_group` counter for each tensor.
+fn sgd_step_dense(opt: &mut Sgd, dense: &mut TrainableDense, group: &mut usize) {
+    opt.step(
+        dense
+            .layer
+            .weights
+            .as_slice_mut()
+            .expect("contiguous weights"),
+        dense.grad_weights.as_slice().expect("contiguous grad"),
+        *group,
+    );
+    *group += 1;
+    opt.step(
+        dense.layer.bias.as_slice_mut().expect("contiguous bias"),
+        dense.grad_bias.as_slice().expect("contiguous grad"),
+        *group,
+    );
+    *group += 1;
+}
+
+/// Computes MSE loss and its gradient w.r.t. the predictions.
+///
+/// The loss and gradient share a single normalization factor `n_timesteps * n_dims` so
+/// that the returned gradient is exactly the derivative of the returned loss:
+///
+/// ```text
+/// loss = sum(diff^2) / (n_timesteps * n_dims)
+/// grad = 2 * diff    / (n_timesteps * n_dims)
+/// ```
+///
+/// where `diff = prediction - target`, `n_timesteps = predictions.len()`, and `n_dims` is
+/// the width of a timestep. Empty input (no timesteps or zero-width timesteps) yields a
+/// zero loss and per-timestep zero gradients rather than dividing by zero.
 ///
 /// # Arguments
 /// * `predictions` - Network outputs
@@ -503,9 +613,20 @@ impl TrainableRnn {
 /// # Returns
 /// (loss, gradients w.r.t. predictions)
 pub fn mse_loss_with_grad(predictions: &[Vec<f64>], targets: &[Vec<f64>]) -> (f64, Vec<Vec<f64>>) {
+    let n_timesteps = predictions.len();
+    let n_dims = predictions.first().map_or(0, |p| p.len());
+    let denom = (n_timesteps * n_dims) as f64;
+
+    // Graceful empty input: no loss, and a zero gradient matching each timestep's shape.
+    if denom == 0.0 {
+        return (
+            0.0,
+            predictions.iter().map(|p| vec![0.0; p.len()]).collect(),
+        );
+    }
+
     let mut total_loss = 0.0;
-    let mut grad_outputs = Vec::with_capacity(predictions.len());
-    let n = predictions.len() as f64;
+    let mut grad_outputs = Vec::with_capacity(n_timesteps);
 
     for (pred, target) in predictions.iter().zip(targets.iter()) {
         let mut grad = Vec::with_capacity(pred.len());
@@ -513,14 +634,13 @@ pub fn mse_loss_with_grad(predictions: &[Vec<f64>], targets: &[Vec<f64>]) -> (f6
         for (&p, &t) in pred.iter().zip(target.iter()) {
             let diff = p - t;
             total_loss += diff * diff;
-            // Gradient of MSE: 2 * (pred - target) / n
-            grad.push(2.0 * diff / (n * pred.len() as f64));
+            grad.push(2.0 * diff / denom);
         }
 
         grad_outputs.push(grad);
     }
 
-    (total_loss / n, grad_outputs)
+    (total_loss / denom, grad_outputs)
 }
 
 /// Builder for trainable RNN networks.
@@ -566,9 +686,24 @@ impl TrainableRnnBuilder {
         self
     }
 
+    /// Sets the seed for reproducible weight initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
+        self
+    }
+
     /// Builds the trainable RNN.
+    ///
+    /// Weights are initialized from the builder's [`BpttConfig::seed`] (via a single
+    /// generator), so two builders with the same seed and shape produce identical networks.
     pub fn build(self) -> TrainableRnn {
-        TrainableRnn::new(self.input_dim, self.hidden_dim, self.output_dim).with_config(self.config)
+        TrainableRnn::with_seed(
+            self.input_dim,
+            self.hidden_dim,
+            self.output_dim,
+            self.config.seed,
+        )
+        .with_config(self.config)
     }
 }
 
@@ -676,6 +811,40 @@ mod tests {
     }
 
     #[test]
+    fn test_mse_loss_with_grad_hand_computed() {
+        // 2 timesteps x 2 dims => denom = n_timesteps * n_dims = 4.
+        let predictions = vec![vec![1.0, 3.0], vec![5.0, 2.0]];
+        let targets = vec![vec![0.0, 1.0], vec![2.0, 2.0]];
+        // diffs: [1, 2], [3, 0]; sum(diff^2) = 1 + 4 + 9 + 0 = 14 => loss = 14 / 4 = 3.5.
+        let (loss, grads) = mse_loss_with_grad(&predictions, &targets);
+        assert_relative_eq!(loss, 3.5, epsilon = 1e-12);
+
+        // grad = 2 * diff / 4 = diff / 2.
+        let expected = [[0.5, 1.0], [1.5, 0.0]];
+        for (grad, exp) in grads.iter().zip(expected.iter()) {
+            for (&g, &e) in grad.iter().zip(exp.iter()) {
+                assert_relative_eq!(g, e, epsilon = 1e-12);
+            }
+        }
+
+        // Loss must be exactly the mean of grad-weighted diffs: gradient is the analytic
+        // derivative of the loss (both divided by the same denom).
+        let recomputed: f64 = predictions
+            .iter()
+            .zip(targets.iter())
+            .flat_map(|(p, t)| p.iter().zip(t.iter()))
+            .map(|(&p, &t)| (p - t).powi(2))
+            .sum::<f64>()
+            / 4.0;
+        assert_relative_eq!(loss, recomputed, epsilon = 1e-12);
+
+        // Empty input is handled gracefully: zero loss, no gradients.
+        let (empty_loss, empty_grads) = mse_loss_with_grad(&[], &[]);
+        assert_eq!(empty_loss, 0.0);
+        assert!(empty_grads.is_empty());
+    }
+
+    #[test]
     fn test_trainable_rnn_builder() {
         let rnn = TrainableRnnBuilder::new(2, 8, 1)
             .learning_rate(0.001)
@@ -723,6 +892,38 @@ mod tests {
     }
 
     #[test]
+    fn test_trainable_rnn_seed_reproducible() {
+        // Same seed → byte-identical serialized network (one RNG threaded through the cell's
+        // two weight matrices and the output projection).
+        let a = TrainableRnnBuilder::new(2, 8, 1).seed(2024).build();
+        let b = TrainableRnnBuilder::new(2, 8, 1).seed(2024).build();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_trainable_rnn_seed_differs() {
+        let a = TrainableRnnBuilder::new(2, 8, 1).seed(2024).build();
+        let b = TrainableRnnBuilder::new(2, 8, 1).seed(2025).build();
+        assert_ne!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_trainable_rnn_with_seed_records_seed() {
+        // The seeded constructor records the seed in its config so the network is
+        // self-describing.
+        let rnn = TrainableRnn::with_seed(2, 4, 1, Some(11));
+        assert_eq!(rnn.config.seed, Some(11));
+        // Unseeded construction leaves the seed unset.
+        assert_eq!(TrainableRnn::new(2, 4, 1).config.seed, None);
+    }
+
+    #[test]
     fn test_trainable_rnn_serialization() {
         let rnn = TrainableRnn::new(2, 4, 1);
 
@@ -742,19 +943,17 @@ mod tests {
         layer.backward(&input, &grad_output);
 
         let config = BpttConfig::new(0.1).with_gradient_clip(1.0);
-        let original_weights = layer.weights.clone();
+        let original_weights = layer.weights().clone();
         layer.update(&config);
 
         // Weights should have changed but not by huge amounts due to clipping
-        for i in 0..2 {
-            for j in 0..2 {
-                let diff = (layer.weights[i][j] - original_weights[i][j]).abs();
-                assert!(
-                    diff < 1.0,
-                    "Weight change {} exceeds expected with clipping",
-                    diff
-                );
-            }
+        for (w, orig_w) in layer.weights().iter().zip(original_weights.iter()) {
+            let diff = (w - orig_w).abs();
+            assert!(
+                diff < 1.0,
+                "Weight change {} exceeds expected with clipping",
+                diff
+            );
         }
     }
 }

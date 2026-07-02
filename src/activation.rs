@@ -161,11 +161,17 @@ pub fn softplus_derivative(x: f64) -> f64 {
 /// Enum representing available activation functions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationFunction {
+    /// Logistic sigmoid, `1 / (1 + exp(-x))`, mapping to `(0, 1)`.
     Sigmoid,
+    /// Hyperbolic tangent, mapping to `(-1, 1)`.
     Tanh,
+    /// Rectified linear unit, `max(0, x)`.
     ReLU,
+    /// Leaky ReLU: `x` for `x > 0`, otherwise a small negative slope.
     LeakyReLU,
+    /// Softplus, `ln(1 + exp(x))`, a smooth approximation to ReLU.
     Softplus,
+    /// Identity: returns the input unchanged.
     Linear,
 }
 

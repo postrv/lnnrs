@@ -4,7 +4,12 @@
 //! This module implements the fundamental building blocks of the Liquid Neural Network:
 //! - `Neuron`: Represents a single neuron with membrane potential, gating dynamics, etc.
 //! - `Synapse`: Represents a directed connection between two neurons.
-//! - `NeuronEvent`: Represents a firing event from a neuron.
+//! - `ThresholdAdaptation`: Optional homeostatic threshold plasticity for a neuron.
+//!
+//! Neurons are decoupled from the network topology: [`Neuron::update_state`] performs a
+//! single leaky-integrate-and-fire step given a scalar input current, and returns whether
+//! the neuron fired. Signal routing, delays and propagation are owned by the network
+//! (`LiquidNeuralNetwork::run_simulation`), which indexes neurons positionally.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,10 +70,51 @@ pub struct Neuron {
     /// Resting membrane potential (defaults to biological -69mV, use 0.0 for logic gates)
     #[serde(default = "default_rest_potential")]
     pub rest_potential: f64,
+    /// Constant bias current added to the membrane potential on every update step.
+    ///
+    /// This is used to make a neuron read "true" by default (e.g. the output neuron of a
+    /// NOT/NAND/NOR gate) without a one-shot potential hack: because it is applied every
+    /// step it survives the leaky decay. Defaults to `0.0`.
+    #[serde(default)]
+    pub bias: f64,
+    /// Optional, bounded homeostatic threshold adaptation. Disabled by default so that
+    /// explicitly configured thresholds (logic gates!) stay put.
+    #[serde(default)]
+    pub adaptation: ThresholdAdaptation,
 }
 
 fn default_rest_potential() -> f64 {
     config::MEMBRANE_POTENTIAL_REST
+}
+
+/// Bounded, opt-in homeostatic threshold adaptation for a [`Neuron`].
+///
+/// When [`enabled`](Self::enabled), the neuron's firing threshold increases by
+/// [`increment`](Self::increment) after every step on which it fired and decays by the same
+/// amount toward [`min`](Self::min) on steps where it did not fire, always clamped to
+/// `[min, max]`. Homeostasis therefore reacts to *firing activity*, not to the resting
+/// potential. Disabled by default.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct ThresholdAdaptation {
+    /// Whether adaptation is active. Defaults to `false`.
+    pub enabled: bool,
+    /// Amount the threshold moves per step. Defaults to `0.1`.
+    pub increment: f64,
+    /// Lower clamp for the threshold. Defaults to `0.5`.
+    pub min: f64,
+    /// Upper clamp for the threshold. Defaults to `2.0`.
+    pub max: f64,
+}
+
+impl Default for ThresholdAdaptation {
+    fn default() -> Self {
+        ThresholdAdaptation {
+            enabled: false,
+            increment: config::THRESHOLD_ADJUSTMENT_INCREMENT,
+            min: config::MIN_THRESHOLD,
+            max: 2.0,
+        }
+    }
 }
 
 impl Default for Neuron {
@@ -94,6 +140,8 @@ impl Neuron {
             recovery: 0.0,
             threshold,
             rest_potential: config::MEMBRANE_POTENTIAL_REST,
+            bias: 0.0,
+            adaptation: ThresholdAdaptation::default(),
         }
     }
 
@@ -111,6 +159,8 @@ impl Neuron {
             recovery: 0.0,
             threshold,
             rest_potential: config::MEMBRANE_POTENTIAL_REST,
+            bias: 0.0,
+            adaptation: ThresholdAdaptation::default(),
         }
     }
 
@@ -128,74 +178,60 @@ impl Neuron {
             recovery: 0.0,
             threshold,
             rest_potential: 0.0, // Use 0 for normalized logic gate behavior
+            bias: 0.0,
+            adaptation: ThresholdAdaptation::default(),
         }
     }
 
-    /// Dynamically adjusts the neuron's firing threshold based on activity.
+    /// Advances the neuron by one leaky-integrate-and-fire step.
     ///
-    /// This implements adaptive thresholding - a form of homeostatic plasticity.
-    fn adjust_threshold(&mut self) {
-        if self.membrane_potential > config::THRESHOLD_ADJUSTMENT_BOUNDARY {
-            self.threshold += config::THRESHOLD_ADJUSTMENT_INCREMENT;
-        } else {
-            self.threshold = (self.threshold - config::THRESHOLD_ADJUSTMENT_INCREMENT)
-                .max(config::MIN_THRESHOLD);
-        }
-    }
-
-    /// Updates the state of the neuron based on its inputs and current state.
+    /// The update is, in order:
+    /// 1. Leaky integration of the scalar `input_current` (through the membrane resistance)
+    ///    toward `rest_potential` with time constant `MEMBRANE_TIME_CONSTANT`.
+    /// 2. Injection of the constant [`bias`](Self::bias) current.
+    /// 3. Threshold check: if the potential exceeds `threshold` the neuron *fires* and is
+    ///    reset to `rest_potential`.
+    /// 4. Optional bounded [`ThresholdAdaptation`].
     ///
-    /// This is the main simulation step for a neuron, implementing:
-    /// 1. Leaky integration of input current
-    /// 2. Threshold checking and spike generation
-    /// 3. Adaptive threshold adjustment
+    /// The neuron is intentionally unaware of synapses: the network snapshots potentials and
+    /// routes signals through its delay buffers. `input_current` is the total current
+    /// arriving at this neuron on this timestep.
     ///
     /// # Arguments
-    /// * `input_current` - External current input to the neuron
-    /// * `synapses` - Slice of synapses connected to this neuron
+    /// * `input_current` - Total external/synaptic current arriving this timestep
     ///
     /// # Returns
-    /// Vector of `NeuronEvent`s generated if the neuron fires
-    pub fn update_state(&mut self, input_current: f64, synapses: &[Synapse]) -> Vec<NeuronEvent> {
-        log::debug!("Neuron {} state before update: {:?}", self.id, self);
-
-        // Update the neuron's potential based on the leaky integrate-and-fire model
-        // Uses the neuron's rest_potential (0.0 for logic gates, -69.0 for biological)
-        // dt is the simulation time step (1.0 ms)
+    /// `true` if the neuron fired (crossed threshold and was reset), `false` otherwise.
+    pub fn update_state(&mut self, input_current: f64) -> bool {
+        // Leaky integrate-and-fire step. `rest_potential` is 0.0 for logic gates and
+        // -69.0 for the biological default; dt is the simulation time step (1.0 ms).
         const DT: f64 = 1.0;
         let leakage_rate =
             (self.rest_potential - self.membrane_potential) / config::MEMBRANE_TIME_CONSTANT;
         self.membrane_potential +=
             (input_current * config::MEMBRANE_RESISTANCE + leakage_rate) * DT;
 
-        // Check for threshold crossing and potentially fire the neuron
-        let events = if self.membrane_potential > self.threshold {
-            let events = self.fire(synapses);
+        // Constant bias current (persists across steps, unlike a one-shot potential offset).
+        self.membrane_potential += self.bias;
+
+        // Threshold crossing: fire and reset.
+        let fired = self.membrane_potential > self.threshold;
+        if fired {
             self.membrane_potential = self.rest_potential;
-            events
-        } else {
-            Vec::new()
-        };
+        }
 
-        self.adjust_threshold();
-        log::debug!("Neuron {} state after update: {:?}", self.id, self);
+        // Bounded, activity-driven threshold homeostasis (opt-in).
+        if self.adaptation.enabled {
+            let delta = if fired {
+                self.adaptation.increment
+            } else {
+                -self.adaptation.increment
+            };
+            self.threshold =
+                (self.threshold + delta).clamp(self.adaptation.min, self.adaptation.max);
+        }
 
-        events
-    }
-
-    /// Simulates the neuron firing, generating events for downstream neurons.
-    ///
-    /// # Arguments
-    /// * `synapses` - Slice of outgoing synapses from this neuron
-    ///
-    /// # Returns
-    /// Vector of `NeuronEvent`s, one for each synapse where this neuron is the source
-    fn fire(&self, synapses: &[Synapse]) -> Vec<NeuronEvent> {
-        synapses
-            .iter()
-            .filter(|synapse| synapse.source == self.id)
-            .map(|synapse| NeuronEvent::new(synapse.target, synapse.weight))
-            .collect()
+        fired
     }
 
     /// Computes the derivative of the neuron state for ODE integration.
@@ -270,9 +306,13 @@ impl Neuron {
 /// Struct to hold neuron state derivatives for ODE integration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeuronDerivatives {
+    /// Time derivative of the membrane potential.
     pub d_membrane_potential: f64,
+    /// Time derivative of the gating variable.
     pub d_gating_variable: f64,
+    /// Time derivative of the time constant.
     pub d_time_constant: f64,
+    /// Time derivative of the recovery variable.
     pub d_recovery: f64,
 }
 
@@ -323,44 +363,6 @@ impl Synapse {
         }
     }
 
-    /// Propagates a signal from the source neuron to the target neuron.
-    ///
-    /// The signal is modulated by the synaptic weight and passed through
-    /// a sigmoid nonlinearity.
-    ///
-    /// # Arguments
-    /// * `source_activity` - The membrane potential of the source neuron
-    /// * `neurons` - Mutable slice of all neurons in the network
-    /// * `current_time` - Current simulation timestep
-    pub fn propagate_signal(
-        &self,
-        source_activity: f64,
-        neurons: &mut [Neuron],
-        current_time: u32,
-    ) {
-        // Only propagate if delay has been satisfied
-        if current_time >= self.delay {
-            if let Some(target_neuron) = neurons.get_mut(self.target) {
-                log::debug!(
-                    "Propagating signal from neuron {} to neuron {} at time {}",
-                    self.source,
-                    self.target,
-                    current_time
-                );
-
-                // Linear signal propagation for clear input-output relationships
-                let signal = self.weight * source_activity;
-                target_neuron.membrane_potential += signal;
-
-                log::debug!(
-                    "Neuron {} state after receiving signal: {:?}",
-                    self.target,
-                    target_neuron
-                );
-            }
-        }
-    }
-
     /// Calculates the stimulation effect without applying it.
     ///
     /// # Arguments
@@ -380,31 +382,6 @@ impl Synapse {
     /// Checks if this synapse is inhibitory (negative weight).
     pub fn is_inhibitory(&self) -> bool {
         self.weight < 0.0
-    }
-}
-
-/// Represents an event generated by a neuron when it fires.
-///
-/// These events are used to communicate spike information between neurons.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NeuronEvent {
-    /// Index of the target neuron that should receive this event
-    pub target_index: usize,
-    /// Strength of the signal (typically the synaptic weight)
-    pub signal_strength: f64,
-}
-
-impl NeuronEvent {
-    /// Creates a new neuron event.
-    ///
-    /// # Arguments
-    /// * `target_index` - Index of the target neuron
-    /// * `signal_strength` - Strength of the signal
-    pub fn new(target_index: usize, signal_strength: f64) -> Self {
-        NeuronEvent {
-            target_index,
-            signal_strength,
-        }
     }
 }
 
@@ -513,12 +490,81 @@ mod tests {
         fn test_neuron_update_state_no_fire() {
             setup();
             let mut neuron = Neuron::new(100.0); // Very high threshold
-            let synapses: Vec<Synapse> = vec![];
 
-            let events = neuron.update_state(0.01, &synapses);
+            let fired = neuron.update_state(0.01);
 
-            assert!(events.is_empty());
+            assert!(!fired);
             assert!(neuron.membrane_potential != 0.0);
+        }
+
+        #[test]
+        fn test_neuron_update_state_fires_and_resets() {
+            setup();
+            let mut neuron = Neuron::new(0.5);
+            neuron.rest_potential = 0.0;
+
+            // A large input current drives the potential over threshold.
+            let fired = neuron.update_state(10.0);
+
+            assert!(fired);
+            // On firing the potential is reset to the rest potential.
+            assert_eq!(neuron.membrane_potential, neuron.rest_potential);
+        }
+
+        #[test]
+        fn test_neuron_bias_persists_each_step() {
+            setup();
+            let mut neuron = Neuron::new(1e9); // never fires
+            neuron.rest_potential = 0.0;
+            neuron.bias = 0.5;
+
+            // With zero input the potential converges toward bias / (1 - leak) = 7 * bias.
+            for _ in 0..200 {
+                neuron.update_state(0.0);
+            }
+            assert_relative_eq!(neuron.membrane_potential, 3.5, epsilon = 1e-6);
+        }
+
+        #[test]
+        fn test_threshold_adaptation_disabled_by_default() {
+            setup();
+            let mut neuron = Neuron::new(0.5);
+            neuron.rest_potential = 0.0;
+            let threshold_before = neuron.threshold;
+
+            // Fire it a few times; threshold must not move while adaptation is off.
+            for _ in 0..5 {
+                neuron.update_state(10.0);
+            }
+            assert_eq!(neuron.threshold, threshold_before);
+        }
+
+        #[test]
+        fn test_threshold_adaptation_enabled_is_bounded() {
+            setup();
+            let mut neuron = Neuron::new(0.5);
+            neuron.rest_potential = 0.0;
+            neuron.adaptation = ThresholdAdaptation {
+                enabled: true,
+                increment: 0.1,
+                min: 0.5,
+                max: 1.0,
+            };
+
+            // Repeated firing raises the threshold but it is clamped to `max`.
+            for _ in 0..100 {
+                neuron.update_state(100.0);
+            }
+            assert!(neuron.threshold <= 1.0);
+            assert_relative_eq!(neuron.threshold, 1.0, epsilon = 1e-9);
+
+            // Repeated non-firing lowers it, clamped to `min`.
+            neuron.threshold = 1.0;
+            for _ in 0..100 {
+                neuron.update_state(0.0);
+            }
+            assert!(neuron.threshold >= 0.5);
+            assert_relative_eq!(neuron.threshold, 0.5, epsilon = 1e-9);
         }
 
         #[test]
@@ -596,36 +642,6 @@ mod tests {
         }
 
         #[test]
-        fn test_synapse_propagate_signal() {
-            setup();
-            let synapse = Synapse::new(0, 1, 0.5, 0);
-            let mut neurons = vec![Neuron::with_id(0, 0.5), Neuron::with_id(1, 0.5)];
-
-            let initial_potential = neurons[1].membrane_potential;
-            synapse.propagate_signal(1.0, &mut neurons, 0);
-
-            // Target neuron should have increased potential
-            assert!(neurons[1].membrane_potential > initial_potential);
-        }
-
-        #[test]
-        fn test_synapse_propagate_signal_with_delay() {
-            setup();
-            let synapse = Synapse::new(0, 1, 0.5, 5);
-            let mut neurons = vec![Neuron::with_id(0, 0.5), Neuron::with_id(1, 0.5)];
-
-            let initial_potential = neurons[1].membrane_potential;
-
-            // Before delay is satisfied
-            synapse.propagate_signal(1.0, &mut neurons, 2);
-            assert_eq!(neurons[1].membrane_potential, initial_potential);
-
-            // After delay is satisfied
-            synapse.propagate_signal(1.0, &mut neurons, 5);
-            assert!(neurons[1].membrane_potential > initial_potential);
-        }
-
-        #[test]
         fn test_synapse_serialization() {
             setup();
             let synapse = Synapse::new(0, 1, 0.75, 3);
@@ -638,64 +654,6 @@ mod tests {
             assert_eq!(synapse.target, deserialized.target);
             assert_eq!(synapse.weight, deserialized.weight);
             assert_eq!(synapse.delay, deserialized.delay);
-        }
-    }
-
-    mod neuron_event_tests {
-        use super::*;
-
-        #[test]
-        fn test_neuron_event_creation() {
-            let event = NeuronEvent::new(5, 0.75);
-
-            assert_eq!(event.target_index, 5);
-            assert_eq!(event.signal_strength, 0.75);
-        }
-
-        #[test]
-        fn test_neuron_event_equality() {
-            let event1 = NeuronEvent::new(5, 0.75);
-            let event2 = NeuronEvent::new(5, 0.75);
-            let event3 = NeuronEvent::new(6, 0.75);
-
-            assert_eq!(event1, event2);
-            assert_ne!(event1, event3);
-        }
-    }
-
-    mod integration_tests {
-        use super::*;
-
-        #[test]
-        fn test_neuron_fires_with_connected_synapse() {
-            setup();
-            let mut neurons = vec![Neuron::with_id(0, 0.5), Neuron::with_id(1, 0.5)];
-            let synapse = Synapse::new(0, 1, 0.8, 0);
-            let synapses = vec![synapse.clone()];
-
-            // Set source neuron above threshold
-            neurons[0].membrane_potential = 1.0;
-
-            let events = neurons[0].fire(&synapses);
-
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].target_index, 1);
-            assert_eq!(events[0].signal_strength, 0.8);
-        }
-
-        #[test]
-        fn test_multiple_synapses_from_one_neuron() {
-            setup();
-            let synapses = vec![
-                Synapse::new(0, 1, 0.5, 0),
-                Synapse::new(0, 2, 0.7, 0),
-                Synapse::new(1, 2, 0.3, 0), // Different source
-            ];
-
-            let neuron = Neuron::with_id(0, 0.5);
-            let events = neuron.fire(&synapses);
-
-            assert_eq!(events.len(), 2);
         }
     }
 }

@@ -34,5 +34,7 @@ coverage/
 *.swp
 *~
 
-# Build outputs
+# Build outputs (CSV results written by the `run` subcommand)
+output.csv
+output*.csv
 /output_data.csv

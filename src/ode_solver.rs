@@ -5,7 +5,7 @@
 //! dynamics of Liquid Neural Networks. The primary solver is the 4th-order Runge-Kutta (RK4)
 //! method, which provides a good balance between accuracy and computational cost.
 
-use crate::error::Result;
+use crate::error::{LnnError, Result};
 
 /// State vector for ODE integration.
 ///
@@ -128,7 +128,12 @@ pub trait OdeSolver {
     /// * `config` - Solver configuration
     ///
     /// # Returns
-    /// The final state and trajectory (if recorded)
+    /// The final state, or [`LnnError::OdeSolver`] if `max_steps` is exhausted before
+    /// reaching `t1`.
+    ///
+    /// # Errors
+    /// Returns an error when the integration hits `config.max_steps` before the endpoint
+    /// `t1` is reached, rather than silently returning a truncated result.
     fn integrate<S: OdeSystem>(
         &self,
         system: &S,
@@ -140,8 +145,12 @@ pub trait OdeSolver {
     ) -> Result<OdeState> {
         let mut state = OdeState::with_time(initial_state, t0);
         let mut steps = 0;
+        let end_tol = endpoint_tolerance(t1);
 
-        while state.time < t1 && steps < config.max_steps {
+        while t1 - state.time > end_tol {
+            if steps >= config.max_steps {
+                return Err(max_steps_error(config.max_steps, t1, state.time));
+            }
             let dt = (t1 - state.time).min(config.dt);
             self.step(system, &mut state, input, dt);
             state.time += dt;
@@ -152,6 +161,9 @@ pub trait OdeSolver {
     }
 
     /// Integrates and records the full trajectory.
+    ///
+    /// # Errors
+    /// Returns [`LnnError::OdeSolver`] when `max_steps` is exhausted before reaching `t1`.
     fn integrate_with_trajectory<S: OdeSystem>(
         &self,
         system: &S,
@@ -164,8 +176,12 @@ pub trait OdeSolver {
         let mut state = OdeState::with_time(initial_state, t0);
         let mut trajectory = vec![state.clone()];
         let mut steps = 0;
+        let end_tol = endpoint_tolerance(t1);
 
-        while state.time < t1 && steps < config.max_steps {
+        while t1 - state.time > end_tol {
+            if steps >= config.max_steps {
+                return Err(max_steps_error(config.max_steps, t1, state.time));
+            }
             let dt = (t1 - state.time).min(config.dt);
             self.step(system, &mut state, input, dt);
             state.time += dt;
@@ -175,6 +191,22 @@ pub trait OdeSolver {
 
         Ok(trajectory)
     }
+}
+
+/// Floating-point-safe tolerance for detecting that integration has reached the endpoint.
+///
+/// Integration terminates once `t1 - t <= EPSILON * max(|t1|, 1.0)`, which avoids taking a
+/// spurious extra sub-step (or looping forever) due to rounding when `t` lands just short
+/// of `t1`.
+fn endpoint_tolerance(t1: f64) -> f64 {
+    f64::EPSILON * t1.abs().max(1.0)
+}
+
+/// Builds the error returned when a solver exhausts `max_steps` before reaching `t1`.
+fn max_steps_error(max_steps: usize, t1: f64, reached: f64) -> LnnError {
+    LnnError::ode_solver(format!(
+        "max_steps ({max_steps}) exhausted before reaching t1 = {t1} (reached t = {reached})"
+    ))
 }
 
 /// Euler method - first order accuracy.
@@ -241,8 +273,16 @@ impl OdeSolver for RungeKutta4 {
 
 /// Dormand-Prince method (RK45) with adaptive step size.
 ///
-/// Uses embedded 4th and 5th order methods for error estimation.
-/// Automatically adjusts step size to maintain accuracy.
+/// Uses embedded 4th and 5th order methods for error estimation and automatically adjusts
+/// the step size to maintain accuracy. Adaptive stepping is First-Same-As-Last (FSAL): the
+/// final stage of an accepted step (`k7 = f(t + dt, y_new)`) is reused as the first stage
+/// (`k1`) of the next step, so a run of accepted steps costs ~6 derivative evaluations per
+/// step rather than 7.
+///
+/// Tolerances (`rtol`/`atol`) are stored on the struct and used by [`OdeSolver::step`] and
+/// [`DormandPrince::adaptive_step`]. [`OdeSolver::integrate`] instead uses the tolerances
+/// carried by the supplied [`SolverConfig`], so a config overrides the struct defaults per
+/// call.
 #[derive(Debug, Clone)]
 pub struct DormandPrince {
     /// Safety factor for step size control
@@ -251,6 +291,10 @@ pub struct DormandPrince {
     min_dt: f64,
     /// Maximum step size
     max_dt: f64,
+    /// Relative error tolerance used by `step`/`adaptive_step`
+    rtol: f64,
+    /// Absolute error tolerance used by `step`/`adaptive_step`
+    atol: f64,
 }
 
 impl Default for DormandPrince {
@@ -259,32 +303,55 @@ impl Default for DormandPrince {
             safety: 0.9,
             min_dt: 1e-10,
             max_dt: 1.0,
+            rtol: 1e-6,
+            atol: 1e-9,
         }
     }
 }
 
 impl DormandPrince {
-    /// Creates a new Dormand-Prince solver with custom parameters.
+    /// Creates a new Dormand-Prince solver with custom step-size bounds.
+    ///
+    /// The error tolerances default to `rtol = 1e-6`, `atol = 1e-9`; override them with
+    /// [`DormandPrince::with_tolerances`].
     pub fn new(safety: f64, min_dt: f64, max_dt: f64) -> Self {
         DormandPrince {
             safety,
             min_dt,
             max_dt,
+            ..Default::default()
         }
     }
 
-    /// Performs one step with adaptive step size control.
+    /// Sets the relative and absolute error tolerances used by [`OdeSolver::step`] and
+    /// [`DormandPrince::adaptive_step`].
     ///
-    /// Returns the actual step size taken.
-    pub fn adaptive_step<S: OdeSystem>(
+    /// Note that [`OdeSolver::integrate`] uses the tolerances from its [`SolverConfig`]
+    /// argument instead, which lets a config override these per call.
+    pub fn with_tolerances(mut self, rtol: f64, atol: f64) -> Self {
+        self.rtol = rtol;
+        self.atol = atol;
+        self
+    }
+
+    /// Computes one trial Dormand-Prince step of size `dt` from `(t, y)`.
+    ///
+    /// `k1 = f(t, y)` is supplied by the caller so it can be reused across rejected
+    /// attempts and threaded between accepted steps (FSAL). Returns the 5th-order solution,
+    /// its final-stage derivative `k7 = f(t + dt, y_new)` (reusable as the next step's
+    /// `k1`), and the normalized RMS error estimate (`<= 1.0` means "accept").
+    #[allow(clippy::too_many_arguments)]
+    fn dp_step<S: OdeSystem>(
         &self,
         system: &S,
-        state: &mut OdeState,
+        t: f64,
+        y: &[f64],
         input: &[f64],
-        suggested_dt: f64,
+        dt: f64,
+        k1: &[f64],
         rtol: f64,
         atol: f64,
-    ) -> f64 {
+    ) -> (Vec<f64>, Vec<f64>, f64) {
         // Dormand-Prince coefficients
         const A21: f64 = 1.0 / 5.0;
         const A31: f64 = 3.0 / 40.0;
@@ -315,90 +382,108 @@ impl DormandPrince {
         const E6: f64 = 22.0 / 525.0;
         const E7: f64 = -1.0 / 40.0;
 
-        let mut dt = suggested_dt.clamp(self.min_dt, self.max_dt);
-        let n = state.values.len();
+        let n = y.len();
+
+        // k1 is provided by the caller (FSAL); compute the remaining stages.
+        let y2: Vec<f64> = (0..n).map(|i| y[i] + dt * A21 * k1[i]).collect();
+        let k2 = system.derivative(t + dt / 5.0, &y2, input);
+
+        let y3: Vec<f64> = (0..n)
+            .map(|i| y[i] + dt * (A31 * k1[i] + A32 * k2[i]))
+            .collect();
+        let k3 = system.derivative(t + 3.0 * dt / 10.0, &y3, input);
+
+        let y4: Vec<f64> = (0..n)
+            .map(|i| y[i] + dt * (A41 * k1[i] + A42 * k2[i] + A43 * k3[i]))
+            .collect();
+        let k4 = system.derivative(t + 4.0 * dt / 5.0, &y4, input);
+
+        let y5: Vec<f64> = (0..n)
+            .map(|i| y[i] + dt * (A51 * k1[i] + A52 * k2[i] + A53 * k3[i] + A54 * k4[i]))
+            .collect();
+        let k5 = system.derivative(t + 8.0 * dt / 9.0, &y5, input);
+
+        let y6: Vec<f64> = (0..n)
+            .map(|i| {
+                y[i] + dt * (A61 * k1[i] + A62 * k2[i] + A63 * k3[i] + A64 * k4[i] + A65 * k5[i])
+            })
+            .collect();
+        let k6 = system.derivative(t + dt, &y6, input);
+
+        // 5th order solution. The 7th-stage weights equal these b-coefficients, so
+        // k7 = f(t + dt, y_new) and DP is FSAL.
+        let y_new: Vec<f64> = (0..n)
+            .map(|i| {
+                y[i] + dt * (A71 * k1[i] + A73 * k3[i] + A74 * k4[i] + A75 * k5[i] + A76 * k6[i])
+            })
+            .collect();
+        let k7 = system.derivative(t + dt, &y_new, input);
+
+        // Normalized RMS error estimate (difference between 5th and 4th order solutions).
+        let err: f64 = (0..n)
+            .map(|i| {
+                let err_i = dt
+                    * (E1 * k1[i] + E3 * k3[i] + E4 * k4[i] + E5 * k5[i] + E6 * k6[i] + E7 * k7[i]);
+                let scale = atol + rtol * y[i].abs().max(y_new[i].abs());
+                (err_i / scale).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt()
+            / (n as f64).sqrt();
+
+        (y_new, k7, err)
+    }
+
+    /// Performs one step with adaptive step size control.
+    ///
+    /// Repeatedly shrinks the step until the estimated error is within tolerance (or the
+    /// minimum step size is reached), writes the accepted solution into `state`, and
+    /// returns the actual step size taken. Standalone (unlike [`OdeSolver::integrate`]) it
+    /// re-evaluates `k1` each call and does not carry FSAL state between calls.
+    pub fn adaptive_step<S: OdeSystem>(
+        &self,
+        system: &S,
+        state: &mut OdeState,
+        input: &[f64],
+        suggested_dt: f64,
+        rtol: f64,
+        atol: f64,
+    ) -> f64 {
         let t = state.time;
         let y = state.values.clone();
+        // k1 = f(t, y) is invariant across rejected attempts (t and y do not move).
+        let k1 = system.derivative(t, &y, input);
+        let mut dt = suggested_dt.clamp(self.min_dt, self.max_dt);
 
         loop {
-            // Compute the 7 stages
-            let k1 = system.derivative(t, &y, input);
-
-            let y2: Vec<f64> = y
-                .iter()
-                .zip(k1.iter())
-                .map(|(yi, k1i)| yi + dt * A21 * k1i)
-                .collect();
-            let k2 = system.derivative(t + dt / 5.0, &y2, input);
-
-            let y3: Vec<f64> = (0..n)
-                .map(|i| y[i] + dt * (A31 * k1[i] + A32 * k2[i]))
-                .collect();
-            let k3 = system.derivative(t + 3.0 * dt / 10.0, &y3, input);
-
-            let y4: Vec<f64> = (0..n)
-                .map(|i| y[i] + dt * (A41 * k1[i] + A42 * k2[i] + A43 * k3[i]))
-                .collect();
-            let k4 = system.derivative(t + 4.0 * dt / 5.0, &y4, input);
-
-            let y5: Vec<f64> = (0..n)
-                .map(|i| y[i] + dt * (A51 * k1[i] + A52 * k2[i] + A53 * k3[i] + A54 * k4[i]))
-                .collect();
-            let k5 = system.derivative(t + 8.0 * dt / 9.0, &y5, input);
-
-            let y6: Vec<f64> = (0..n)
-                .map(|i| {
-                    y[i] + dt
-                        * (A61 * k1[i] + A62 * k2[i] + A63 * k3[i] + A64 * k4[i] + A65 * k5[i])
-                })
-                .collect();
-            let k6 = system.derivative(t + dt, &y6, input);
-
-            // 5th order solution
-            let y_new: Vec<f64> = (0..n)
-                .map(|i| {
-                    y[i] + dt
-                        * (A71 * k1[i] + A73 * k3[i] + A74 * k4[i] + A75 * k5[i] + A76 * k6[i])
-                })
-                .collect();
-
-            let k7 = system.derivative(t + dt, &y_new, input);
-
-            // Error estimate
-            let err: f64 = (0..n)
-                .map(|i| {
-                    let err_i = dt
-                        * (E1 * k1[i]
-                            + E3 * k3[i]
-                            + E4 * k4[i]
-                            + E5 * k5[i]
-                            + E6 * k6[i]
-                            + E7 * k7[i]);
-                    let scale = atol + rtol * y[i].abs().max(y_new[i].abs());
-                    (err_i / scale).powi(2)
-                })
-                .sum::<f64>()
-                .sqrt()
-                / (n as f64).sqrt();
+            let (y_new, _k7, err) = self.dp_step(system, t, &y, input, dt, &k1, rtol, atol);
 
             if err <= 1.0 || dt <= self.min_dt {
-                // Accept step
                 state.values = y_new;
                 return dt;
             }
 
-            // Reject step and reduce dt
-            let factor = self.safety * (1.0 / err).powf(0.2);
-            dt = (dt * factor.clamp(0.1, 0.5)).max(self.min_dt);
+            // Reject step and reduce dt.
+            let factor = (self.safety * error_factor(err)).clamp(0.1, 0.5);
+            dt = (dt * factor).max(self.min_dt);
         }
+    }
+}
+
+/// Standard embedded-RK step-size factor `err^(-1/5)` (guarding `err == 0`).
+fn error_factor(err: f64) -> f64 {
+    if err > 0.0 {
+        err.powf(-0.2)
+    } else {
+        f64::INFINITY
     }
 }
 
 impl OdeSolver for DormandPrince {
     fn step<S: OdeSystem>(&self, system: &S, state: &mut OdeState, input: &[f64], dt: f64) {
-        // For the basic step interface, use fixed step RK4-like behavior
-        // For adaptive stepping, use adaptive_step directly
-        self.adaptive_step(system, state, input, dt, 1e-6, 1e-9);
+        // The basic (fixed-size) step interface performs a single adaptive step using the
+        // solver's own tolerances.
+        self.adaptive_step(system, state, input, dt, self.rtol, self.atol);
     }
 
     fn integrate<S: OdeSystem>(
@@ -411,18 +496,59 @@ impl OdeSolver for DormandPrince {
         config: &SolverConfig,
     ) -> Result<OdeState> {
         let mut state = OdeState::with_time(initial_state, t0);
-        let mut steps = 0;
         let mut dt = config.dt;
+        let mut steps = 0;
+        let end_tol = endpoint_tolerance(t1);
+        // FSAL: k1 for the current step, reused from the previous accepted step's k7.
+        let mut cached_k1: Option<Vec<f64>> = None;
 
-        while state.time < t1 && steps < config.max_steps {
-            let remaining = t1 - state.time;
-            let step_dt = dt.min(remaining);
-            let actual_dt =
-                self.adaptive_step(system, &mut state, input, step_dt, config.rtol, config.atol);
-            state.time += actual_dt;
+        while t1 - state.time > end_tol {
+            if steps >= config.max_steps {
+                return Err(max_steps_error(config.max_steps, t1, state.time));
+            }
 
-            // Adjust suggested dt based on what worked
-            dt = actual_dt * 1.5;
+            let t = state.time;
+            let y = state.values.clone();
+            let remaining = t1 - t;
+
+            // k1 = f(t, y): reuse the previous step's k7 under FSAL, else evaluate it.
+            let k1 = match cached_k1.take() {
+                Some(k) => k,
+                None => system.derivative(t, &y, input),
+            };
+
+            // Try a step from (t, y); on rejection, shrink and retry. k1 stays valid
+            // across attempts because (t, y) does not move until a step is accepted.
+            let mut trial_dt = dt.min(remaining).clamp(self.min_dt, self.max_dt);
+            loop {
+                let (y_new, k7, err) = self.dp_step(
+                    system,
+                    t,
+                    &y,
+                    input,
+                    trial_dt,
+                    &k1,
+                    config.rtol,
+                    config.atol,
+                );
+
+                if err <= 1.0 || trial_dt <= self.min_dt {
+                    // Accept the step.
+                    state.values = y_new;
+                    state.time = t + trial_dt;
+                    // FSAL: k7 = f(t + dt, y_new) becomes the next step's k1.
+                    cached_k1 = Some(k7);
+                    // Error-based growth of the next suggested step size.
+                    let factor = (self.safety * error_factor(err)).clamp(0.2, 5.0);
+                    dt = (trial_dt * factor).clamp(self.min_dt, self.max_dt);
+                    break;
+                }
+
+                // Reject: shrink and retry from the same (t, y).
+                let factor = (self.safety * error_factor(err)).clamp(0.1, 0.5);
+                trial_dt = (trial_dt * factor).max(self.min_dt);
+            }
+
             steps += 1;
         }
 
@@ -439,6 +565,7 @@ pub struct ExponentialDecay {
 }
 
 impl ExponentialDecay {
+    /// Creates an exponential-decay system `dy/dt = -decay_rate * y`.
     pub fn new(decay_rate: f64) -> Self {
         ExponentialDecay { decay_rate }
     }
@@ -461,6 +588,8 @@ pub struct HarmonicOscillator {
 }
 
 impl HarmonicOscillator {
+    /// Creates an undamped harmonic oscillator with angular frequency `omega`
+    /// (`dy/dt = v`, `dv/dt = -omega^2 * y`).
     pub fn new(omega: f64) -> Self {
         HarmonicOscillator { omega }
     }
@@ -512,7 +641,7 @@ mod tests {
             .integrate(&system, vec![1.0], &[], 0.0, 1.0, &config)
             .unwrap();
 
-        // y(t) = e^(-t), so y(1) ≈ 0.368
+        // y(t) = e^(-t), so y(1) ~= 0.368
         assert_relative_eq!(state.values[0], (-1.0_f64).exp(), epsilon = 0.01);
     }
 
@@ -536,7 +665,7 @@ mod tests {
         let solver = RungeKutta4;
         let config = SolverConfig::new(0.01);
 
-        // Initial: y=1, v=0 → Solution: y=cos(t), v=-sin(t)
+        // Initial: y=1, v=0 -> Solution: y=cos(t), v=-sin(t)
         let state = solver
             .integrate(
                 &system,
@@ -548,7 +677,7 @@ mod tests {
             )
             .unwrap();
 
-        // After half period: y ≈ -1, v ≈ 0
+        // After half period: y ~= -1, v ~= 0
         assert_relative_eq!(state.values[0], -1.0, epsilon = 1e-4);
         assert_relative_eq!(state.values[1], 0.0, epsilon = 1e-4);
     }
@@ -606,7 +735,7 @@ mod tests {
 
         solver.step(&system, &mut state, &[], 0.1);
 
-        // RK4 approximation of e^(-0.1) ≈ 0.9048374
+        // RK4 approximation of e^(-0.1) ~= 0.9048374
         // RK4 has O(h^5) local error, so with h=0.1, error is ~1e-6
         assert_relative_eq!(state.values[0], (-0.1_f64).exp(), epsilon = 1e-6);
     }
@@ -617,12 +746,10 @@ mod tests {
         let solver = EulerSolver;
         let config = SolverConfig::new(0.0001).with_max_steps(100);
 
-        let state = solver
-            .integrate(&system, vec![1.0], &[], 0.0, 1000.0, &config)
-            .unwrap();
-
-        // Should stop due to max_steps, not reaching t1
-        assert!(state.time < 1000.0);
+        // Integration cannot reach t1 = 1000 within 100 steps of size 1e-4, so it must
+        // now report an error rather than silently returning a truncated state.
+        let result = solver.integrate(&system, vec![1.0], &[], 0.0, 1000.0, &config);
+        assert!(matches!(result, Err(crate::error::LnnError::OdeSolver(_))));
     }
 
     #[test]
@@ -649,5 +776,82 @@ mod tests {
             .unwrap();
 
         assert_relative_eq!(state.values[0], 1.0, epsilon = 1e-6);
+    }
+
+    /// Wraps an [`OdeSystem`] and counts every derivative evaluation via a shared cell.
+    struct CountingSystem<'a, S: OdeSystem> {
+        inner: S,
+        count: &'a std::cell::Cell<usize>,
+    }
+
+    impl<S: OdeSystem> OdeSystem for CountingSystem<'_, S> {
+        fn derivative(&self, t: f64, state: &[f64], input: &[f64]) -> Vec<f64> {
+            self.count.set(self.count.get() + 1);
+            self.inner.derivative(t, state, input)
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+    }
+
+    #[test]
+    fn test_dormand_prince_looser_tolerance_uses_fewer_evals() {
+        let solver = DormandPrince::default();
+
+        let loose_count = std::cell::Cell::new(0);
+        let loose_system = CountingSystem {
+            inner: ExponentialDecay::new(1.0),
+            count: &loose_count,
+        };
+        let loose_cfg = SolverConfig::new(0.1).with_rtol(1e-2).with_atol(1e-2);
+        solver
+            .integrate(&loose_system, vec![1.0], &[], 0.0, 10.0, &loose_cfg)
+            .unwrap();
+
+        let tight_count = std::cell::Cell::new(0);
+        let tight_system = CountingSystem {
+            inner: ExponentialDecay::new(1.0),
+            count: &tight_count,
+        };
+        let tight_cfg = SolverConfig::new(0.1).with_rtol(1e-10).with_atol(1e-12);
+        solver
+            .integrate(&tight_system, vec![1.0], &[], 0.0, 10.0, &tight_cfg)
+            .unwrap();
+
+        assert!(
+            loose_count.get() < tight_count.get(),
+            "loose tolerance ({}) should need fewer derivative evals than tight ({})",
+            loose_count.get(),
+            tight_count.get()
+        );
+    }
+
+    #[test]
+    fn test_dormand_prince_fsal_six_evals_per_step() {
+        // Pin the step size (min_dt == max_dt == 0.25) so every step is accepted on the
+        // first try and the endpoint (t1 = 1.0) is hit exactly after 4 steps. With FSAL,
+        // the total derivative-evaluation count is 6 per step plus one extra for the very
+        // first step's k1: 7 + 6*3 = 25, rather than 7*4 = 28 without FSAL.
+        let solver = DormandPrince::new(0.9, 0.25, 0.25);
+        let count = std::cell::Cell::new(0);
+        let system = CountingSystem {
+            inner: ExponentialDecay::new(1.0),
+            count: &count,
+        };
+        let config = SolverConfig::new(0.25);
+
+        let state = solver
+            .integrate(&system, vec![1.0], &[], 0.0, 1.0, &config)
+            .unwrap();
+
+        assert_relative_eq!(state.time, 1.0, epsilon = 1e-12);
+        let n_steps = 4;
+        assert_eq!(
+            count.get(),
+            6 * n_steps + 1,
+            "FSAL should yield 6 evals/step after the first (got {})",
+            count.get()
+        );
     }
 }
