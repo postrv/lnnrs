@@ -35,6 +35,31 @@
 //! - Builder pattern for network configuration
 //! - Full serialization support via serde
 //! - Comprehensive test coverage
+//!
+//! # Reproducibility
+//!
+//! Every network's random initialization is reproducible. Each configuration
+//! (`LnnConfig`, `LtcConfig`, `CfcConfig`, `BpttConfig`) carries an optional
+//! `seed: Option<u64>`, and every builder exposes a `.seed(u64)` method. When a seed is set,
+//! the whole network is constructed from a single [`rand::rngs::StdRng`] seeded with that
+//! value: `StdRng::seed_from_u64(seed)`. When no seed is set, the generator is seeded from
+//! entropy (`StdRng::from_entropy`). A single generator is threaded through every layer in a
+//! fixed order, so two networks built from the same seed are byte-for-byte identical,
+//! including their serialized JSON:
+//!
+//! ```rust
+//! use liquid_neural_network::prelude::*;
+//!
+//! let a = CfcBuilder::new(2, 1).hidden_units(8).seed(42).build();
+//! let b = CfcBuilder::new(2, 1).hidden_units(8).seed(42).build();
+//! assert_eq!(
+//!     serde_json::to_string(&a).unwrap(),
+//!     serde_json::to_string(&b).unwrap(),
+//! );
+//! ```
+//!
+//! For `TrainableRnn`, use `TrainableRnnBuilder::new(..).seed(u64)` or the direct
+//! constructor `TrainableRnn::with_seed(input, hidden, output, Some(seed))`.
 
 pub mod activation;
 pub mod cfc;

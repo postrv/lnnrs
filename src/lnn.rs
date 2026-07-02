@@ -10,7 +10,8 @@ use crate::network_components::{Neuron, Synapse};
 use nalgebra::ComplexField;
 use nalgebra::DMatrix;
 use ndarray::Array2;
-use rand::{thread_rng, Rng};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -171,6 +172,10 @@ pub struct LnnConfig {
     pub threshold_range: (f64, f64),
     /// Connection probability (0.0 to 1.0)
     pub connection_probability: f64,
+    /// Optional seed for reproducible random initialization. When `Some(seed)`, the network
+    /// is built from a `StdRng` seeded with `seed` (identical seed → identical network);
+    /// when `None`, the RNG is seeded from entropy.
+    pub seed: Option<u64>,
 }
 
 impl Default for LnnConfig {
@@ -182,6 +187,7 @@ impl Default for LnnConfig {
             delay_range: (1, 5),
             threshold_range: (0.5, 1.0),
             connection_probability: 1.0, // Fully connected by default
+            seed: None,
         }
     }
 }
@@ -222,6 +228,15 @@ impl LnnConfig {
     /// Sets the connection probability.
     pub fn with_connection_probability(mut self, prob: f64) -> Self {
         self.connection_probability = prob.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sets the seed for reproducible random initialization.
+    ///
+    /// Two networks built from configurations with the same seed (and otherwise identical
+    /// parameters) are byte-for-byte identical, including their serialized JSON.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -316,6 +331,12 @@ impl LnnBuilder {
     /// Sets the connection probability.
     pub fn connection_probability(mut self, prob: f64) -> Self {
         self.config.connection_probability = prob.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sets the seed for reproducible random initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
         self
     }
 
@@ -436,14 +457,27 @@ impl LiquidNeuralNetwork {
     }
 
     /// Creates a LNN from a configuration.
+    ///
+    /// All randomness is drawn from a single [`StdRng`] created here: seeded with
+    /// `config.seed` when present, otherwise seeded from entropy. Neuron ids are assigned
+    /// deterministically by index (`0..neuron_count`) rather than from a global counter, so
+    /// two networks built from the same seed serialize to byte-identical JSON regardless of
+    /// how many other neurons have been created in the process.
     pub fn from_config(config: LnnConfig) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
         let neuron_count = config.neuron_count;
 
-        // Create neurons with random thresholds (inclusive range sampling).
+        // Create neurons with random thresholds (inclusive range sampling). Ids are the
+        // neuron index so serialization is deterministic and index-aligned.
         let neurons: Vec<Neuron> = (0..neuron_count)
-            .map(|_| {
-                Neuron::new(rng.gen_range(config.threshold_range.0..=config.threshold_range.1))
+            .map(|i| {
+                Neuron::with_id(
+                    i,
+                    rng.gen_range(config.threshold_range.0..=config.threshold_range.1),
+                )
             })
             .collect();
 
@@ -576,7 +610,8 @@ impl LiquidNeuralNetwork {
     /// This replaces all existing synapses with newly generated ones.
     pub fn initialize_synapses(&mut self, spectral_radius: f64) {
         let neuron_count = self.neurons.len();
-        let mut rng = thread_rng();
+        // This is an explicit re-randomization with no seed context; draw from entropy.
+        let mut rng = StdRng::from_entropy();
 
         // Generate random weights
         let raw_weights: Vec<f64> = (0..neuron_count * neuron_count)
@@ -1208,6 +1243,56 @@ mod tests {
         #[should_panic(expected = "invalid LnnConfig")]
         fn test_build_panics_on_invalid_config() {
             let _ = LnnConfig::new(0).build();
+        }
+    }
+
+    mod determinism_tests {
+        use super::*;
+
+        #[test]
+        fn test_lnn_seed_reproducible() {
+            // Two networks built in sequence with the same seed must serialize to
+            // byte-identical JSON. This exercises both the single-RNG threading and the
+            // index-based neuron ids (the global id counter is advanced between the two
+            // builds, so a naive implementation would diverge here).
+            let a = LnnBuilder::new(12)
+                .weight_range(-0.8, 0.8)
+                .threshold_range(0.4, 0.9)
+                .delay_range(1, 4)
+                .seed(1234)
+                .build();
+            let b = LnnBuilder::new(12)
+                .weight_range(-0.8, 0.8)
+                .threshold_range(0.4, 0.9)
+                .delay_range(1, 4)
+                .seed(1234)
+                .build();
+
+            let ja = serde_json::to_string(&a).unwrap();
+            let jb = serde_json::to_string(&b).unwrap();
+            assert_eq!(ja, jb, "same seed must produce identical serialized JSON");
+        }
+
+        #[test]
+        fn test_lnn_seed_differs() {
+            let a = LnnBuilder::new(12).seed(1).build();
+            let b = LnnBuilder::new(12).seed(2).build();
+            assert_ne!(
+                serde_json::to_string(&a).unwrap(),
+                serde_json::to_string(&b).unwrap(),
+                "different seeds must produce different networks"
+            );
+        }
+
+        #[test]
+        fn test_lnn_unseeded_still_works() {
+            // No seed: construction succeeds and produces a valid network.
+            let net = LnnBuilder::new(8).build();
+            assert_eq!(net.neuron_count(), 8);
+            // Ids are still assigned deterministically by index even when unseeded.
+            for (i, neuron) in net.neurons.iter().enumerate() {
+                assert_eq!(neuron.id, i);
+            }
         }
     }
 

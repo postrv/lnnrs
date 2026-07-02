@@ -24,7 +24,8 @@
 //! ```
 
 use crate::activation::tanh;
-use rand::{thread_rng, Rng};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for BPTT training.
@@ -40,6 +41,11 @@ pub struct BpttConfig {
     pub l2_lambda: f64,
     /// Momentum coefficient
     pub momentum: f64,
+    /// Optional seed for reproducible weight initialization. `Some(seed)` seeds a `StdRng`
+    /// with `seed`; `None` seeds from entropy. Consumed by [`TrainableRnnBuilder::build`]
+    /// and [`TrainableRnn::with_seed`].
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for BpttConfig {
@@ -50,6 +56,7 @@ impl Default for BpttConfig {
             gradient_clip: Some(1.0),
             l2_lambda: 1e-4,
             momentum: 0.9,
+            seed: None,
         }
     }
 }
@@ -92,6 +99,12 @@ impl BpttConfig {
         self.momentum = momentum;
         self
     }
+
+    /// Sets the seed for reproducible weight initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
 }
 
 /// Simple dense layer with gradients for training.
@@ -117,8 +130,17 @@ pub struct TrainableDense {
 
 impl TrainableDense {
     /// Creates a new trainable dense layer with random initialization.
+    ///
+    /// Self-contained convenience constructor: it seeds its own [`StdRng`] from entropy.
+    /// Seeded/reproducible construction goes through [`TrainableDense::with_rng`] so a whole
+    /// network can be derived from a single generator.
     pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = StdRng::from_entropy();
+        Self::with_rng(input_dim, output_dim, &mut rng)
+    }
+
+    /// Creates a new trainable dense layer drawing weights from the supplied generator.
+    pub fn with_rng(input_dim: usize, output_dim: usize, rng: &mut StdRng) -> Self {
         let scale = (2.0 / (input_dim + output_dim) as f64).sqrt();
 
         let weights: Vec<Vec<f64>> = (0..input_dim)
@@ -255,11 +277,19 @@ pub struct TrainableRnnCell {
 }
 
 impl TrainableRnnCell {
-    /// Creates a new trainable RNN cell.
+    /// Creates a new trainable RNN cell (RNG seeded from entropy).
     pub fn new(input_dim: usize, hidden_dim: usize) -> Self {
+        let mut rng = StdRng::from_entropy();
+        Self::with_rng(input_dim, hidden_dim, &mut rng)
+    }
+
+    /// Creates a new trainable RNN cell drawing all weights from the supplied generator.
+    ///
+    /// The input and recurrent weight matrices are drawn in that fixed order from `rng`.
+    pub fn with_rng(input_dim: usize, hidden_dim: usize, rng: &mut StdRng) -> Self {
         TrainableRnnCell {
-            w_in: TrainableDense::new(input_dim, hidden_dim),
-            w_rec: TrainableDense::new(hidden_dim, hidden_dim),
+            w_in: TrainableDense::with_rng(input_dim, hidden_dim, rng),
+            w_rec: TrainableDense::with_rng(hidden_dim, hidden_dim, rng),
             hidden_dim,
         }
     }
@@ -355,12 +385,35 @@ pub struct TrainableRnn {
 }
 
 impl TrainableRnn {
-    /// Creates a new trainable RNN.
+    /// Creates a new trainable RNN with weights seeded from entropy.
     pub fn new(input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
+        Self::with_seed(input_dim, hidden_dim, output_dim, None)
+    }
+
+    /// Creates a new trainable RNN with reproducible weight initialization.
+    ///
+    /// A single [`StdRng`] (seeded from `seed`, or from entropy when `None`) is threaded
+    /// through the recurrent cell and then the output projection, so a given seed produces a
+    /// byte-identical network. The seed is also recorded in [`Self::config`] (`config.seed`)
+    /// so the resulting network is self-describing.
+    pub fn with_seed(
+        input_dim: usize,
+        hidden_dim: usize,
+        output_dim: usize,
+        seed: Option<u64>,
+    ) -> Self {
+        let mut rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
+        let config = BpttConfig {
+            seed,
+            ..BpttConfig::default()
+        };
         TrainableRnn {
-            cell: TrainableRnnCell::new(input_dim, hidden_dim),
-            output: TrainableDense::new(hidden_dim, output_dim),
-            config: BpttConfig::default(),
+            cell: TrainableRnnCell::with_rng(input_dim, hidden_dim, &mut rng),
+            output: TrainableDense::with_rng(hidden_dim, output_dim, &mut rng),
+            config,
             cached_states: Vec::new(),
             cached_pre_acts: Vec::new(),
             cached_inputs: Vec::new(),
@@ -588,9 +641,24 @@ impl TrainableRnnBuilder {
         self
     }
 
+    /// Sets the seed for reproducible weight initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
+        self
+    }
+
     /// Builds the trainable RNN.
+    ///
+    /// Weights are initialized from the builder's [`BpttConfig::seed`] (via a single
+    /// generator), so two builders with the same seed and shape produce identical networks.
     pub fn build(self) -> TrainableRnn {
-        TrainableRnn::new(self.input_dim, self.hidden_dim, self.output_dim).with_config(self.config)
+        TrainableRnn::with_seed(
+            self.input_dim,
+            self.hidden_dim,
+            self.output_dim,
+            self.config.seed,
+        )
+        .with_config(self.config)
     }
 }
 
@@ -776,6 +844,38 @@ mod tests {
             initial_loss,
             final_loss
         );
+    }
+
+    #[test]
+    fn test_trainable_rnn_seed_reproducible() {
+        // Same seed → byte-identical serialized network (one RNG threaded through the cell's
+        // two weight matrices and the output projection).
+        let a = TrainableRnnBuilder::new(2, 8, 1).seed(2024).build();
+        let b = TrainableRnnBuilder::new(2, 8, 1).seed(2024).build();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_trainable_rnn_seed_differs() {
+        let a = TrainableRnnBuilder::new(2, 8, 1).seed(2024).build();
+        let b = TrainableRnnBuilder::new(2, 8, 1).seed(2025).build();
+        assert_ne!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_trainable_rnn_with_seed_records_seed() {
+        // The seeded constructor records the seed in its config so the network is
+        // self-describing.
+        let rnn = TrainableRnn::with_seed(2, 4, 1, Some(11));
+        assert_eq!(rnn.config.seed, Some(11));
+        // Unseeded construction leaves the seed unset.
+        assert_eq!(TrainableRnn::new(2, 4, 1).config.seed, None);
     }
 
     #[test]

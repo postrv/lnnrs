@@ -17,7 +17,8 @@
 use crate::activation::{sigmoid, tanh};
 use crate::error::{LnnError, Result};
 use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4};
-use rand::{thread_rng, Rng};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for LTC layers.
@@ -34,6 +35,10 @@ pub struct LtcConfig {
     /// Number of fixed RK4 sub-steps used to integrate one logical timestep over `[0, 1]`
     /// (the integration step size is `1.0 / ode_unfolds`). Must be `>= 1`.
     pub ode_unfolds: usize,
+    /// Optional seed for reproducible random initialization. `Some(seed)` seeds a `StdRng`
+    /// with `seed`; `None` seeds from entropy.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for LtcConfig {
@@ -44,6 +49,7 @@ impl Default for LtcConfig {
             tau_min: 0.1,
             tau_max: 10.0,
             ode_unfolds: 6,
+            seed: None,
         }
     }
 }
@@ -75,6 +81,12 @@ impl LtcConfig {
     /// Larger values give a more accurate integration of the LTC ODE at higher cost.
     pub fn with_ode_unfolds(mut self, unfolds: usize) -> Self {
         self.ode_unfolds = unfolds;
+        self
+    }
+
+    /// Sets the seed for reproducible random initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -126,8 +138,25 @@ pub struct LtcCell {
 
 impl LtcCell {
     /// Creates a new LTC cell with random initialization.
+    ///
+    /// This is a self-contained convenience constructor: it creates its own [`StdRng`] from
+    /// `config.seed` (or from entropy when unseeded). When building a full [`LtcNetwork`],
+    /// [`LtcCell::with_rng`] is used instead so the cell and the output projection share a
+    /// single generator.
     pub fn new(input_dim: usize, config: LtcConfig) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
+        Self::with_rng(input_dim, config, &mut rng)
+    }
+
+    /// Creates a new LTC cell drawing all weights from the supplied generator.
+    ///
+    /// Threading a single [`StdRng`] through every layer of a network is what makes
+    /// construction reproducible; higher-level constructors ([`LtcNetwork::with_config`])
+    /// call this so unit ordering is stable.
+    pub fn with_rng(input_dim: usize, config: LtcConfig, rng: &mut StdRng) -> Self {
         let units = config.units;
 
         // Xavier/Glorot initialization
@@ -310,35 +339,21 @@ pub struct LtcNetwork {
 impl LtcNetwork {
     /// Creates a new LTC network.
     pub fn new(input_dim: usize, hidden_units: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
-        let config = LtcConfig::new(hidden_units);
-        let cell = LtcCell::new(input_dim, config);
-
-        // Xavier initialization for output weights
-        let out_scale = (2.0 / (hidden_units + output_dim) as f64).sqrt();
-        let w_out: Vec<Vec<f64>> = (0..hidden_units)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-out_scale..out_scale))
-                    .collect()
-            })
-            .collect();
-
-        let b_out = vec![0.0; output_dim];
-
-        LtcNetwork {
-            cell,
-            w_out,
-            b_out,
-            output_dim,
-        }
+        Self::with_config(input_dim, output_dim, LtcConfig::new(hidden_units))
     }
 
     /// Creates a new LTC network with custom configuration.
+    ///
+    /// A single [`StdRng`] (seeded from `config.seed`, or from entropy when unseeded) is
+    /// threaded through the cell and then the output projection, so a given seed yields a
+    /// byte-identical network.
     pub fn with_config(input_dim: usize, output_dim: usize, config: LtcConfig) -> Self {
-        let mut rng = thread_rng();
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
         let hidden_units = config.units;
-        let cell = LtcCell::new(input_dim, config);
+        let cell = LtcCell::with_rng(input_dim, config, &mut rng);
 
         let out_scale = (2.0 / (hidden_units + output_dim) as f64).sqrt();
         let w_out: Vec<Vec<f64>> = (0..hidden_units)
@@ -437,6 +452,12 @@ impl LtcBuilder {
     /// Sets the number of RK4 sub-steps used to integrate one logical timestep.
     pub fn ode_unfolds(mut self, unfolds: usize) -> Self {
         self.config.ode_unfolds = unfolds;
+        self
+    }
+
+    /// Sets the seed for reproducible random initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
         self
     }
 
@@ -692,6 +713,35 @@ mod tests {
 
         assert_eq!(network.hidden_dim(), restored.hidden_dim());
         assert_eq!(network.output_dim(), restored.output_dim());
+    }
+
+    #[test]
+    fn test_ltc_seed_reproducible() {
+        // Same seed → byte-identical serialized network (single RNG threaded through the
+        // cell and the output projection).
+        let a = LtcBuilder::new(3, 2).hidden_units(16).seed(7).build();
+        let b = LtcBuilder::new(3, 2).hidden_units(16).seed(7).build();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_ltc_seed_differs() {
+        let a = LtcBuilder::new(3, 2).hidden_units(16).seed(7).build();
+        let b = LtcBuilder::new(3, 2).hidden_units(16).seed(8).build();
+        assert_ne!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_ltc_unseeded_still_works() {
+        let net = LtcNetwork::new(2, 8, 1);
+        assert_eq!(net.hidden_dim(), 8);
+        assert_eq!(net.output_dim(), 1);
     }
 
     #[test]

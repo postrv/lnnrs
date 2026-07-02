@@ -35,7 +35,8 @@
 
 use crate::activation::{sigmoid, tanh};
 use crate::error::{LnnError, Result};
-use rand::{thread_rng, Rng};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for CfC layers.
@@ -55,6 +56,10 @@ pub struct CfcConfig {
     pub backbone_layers: usize,
     /// Units per backbone layer
     pub backbone_units: usize,
+    /// Optional seed for reproducible random initialization. `Some(seed)` seeds a `StdRng`
+    /// with `seed`; `None` seeds from entropy.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 /// Activation function for the backbone network.
@@ -91,6 +96,7 @@ impl Default for CfcConfig {
             backbone_activation: BackboneActivation::SiLU,
             backbone_layers: 2,
             backbone_units: 64,
+            seed: None,
         }
     }
 }
@@ -131,6 +137,12 @@ impl CfcConfig {
         self
     }
 
+    /// Sets the seed for reproducible random initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -163,8 +175,11 @@ struct DenseLayer {
 }
 
 impl DenseLayer {
-    fn new(input_dim: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
+    /// Creates a dense layer with Xavier-initialised weights drawn from `rng`.
+    ///
+    /// The generator is borrowed (never created here) so that every layer of a network is
+    /// derived from the single seeded generator owned by the network constructor.
+    fn new(input_dim: usize, output_dim: usize, rng: &mut StdRng) -> Self {
         let scale = (2.0 / (input_dim + output_dim) as f64).sqrt();
 
         let weights: Vec<Vec<f64>> = (0..input_dim)
@@ -209,15 +224,16 @@ impl Backbone {
         hidden_units: usize,
         num_layers: usize,
         activation: BackboneActivation,
+        rng: &mut StdRng,
     ) -> Self {
         let mut layers = Vec::new();
 
         // First layer
-        layers.push(DenseLayer::new(input_dim, hidden_units));
+        layers.push(DenseLayer::new(input_dim, hidden_units, rng));
 
         // Hidden layers
         for _ in 1..num_layers {
-            layers.push(DenseLayer::new(hidden_units, hidden_units));
+            layers.push(DenseLayer::new(hidden_units, hidden_units, rng));
         }
 
         Backbone { layers, activation }
@@ -277,7 +293,23 @@ impl CfcCell {
     ///
     /// All layers for both the gated and decay modes are constructed; only the layers of
     /// the mode selected by [`CfcConfig::no_gate`] are evaluated during [`CfcCell::forward`].
+    ///
+    /// This self-contained constructor creates its own [`StdRng`] from `config.seed` (or
+    /// from entropy when unseeded). Full networks use [`CfcCell::with_rng`] so the cell and
+    /// output projection share one generator.
     pub fn new(input_dim: usize, config: CfcConfig) -> Self {
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
+        Self::with_rng(input_dim, config, &mut rng)
+    }
+
+    /// Creates a new CfC cell drawing all weights from the supplied generator.
+    ///
+    /// The layer construction order (backbone, then decay-mode layers, then the gated-mode
+    /// heads) is fixed, so a given generator state produces a deterministic cell.
+    pub fn with_rng(input_dim: usize, config: CfcConfig, rng: &mut StdRng) -> Self {
         let state_input_dim = config.units + input_dim;
 
         let backbone = Backbone::new(
@@ -285,20 +317,21 @@ impl CfcCell {
             config.backbone_units,
             config.backbone_layers,
             config.backbone_activation,
+            rng,
         );
 
         let backbone_out_dim = backbone.output_dim();
         let units = config.units;
 
         // Decay-mode layers.
-        let ff_projection = DenseLayer::new(backbone_out_dim, units);
-        let tau_layer = DenseLayer::new(backbone_out_dim, units);
+        let ff_projection = DenseLayer::new(backbone_out_dim, units, rng);
+        let tau_layer = DenseLayer::new(backbone_out_dim, units, rng);
 
         // Gated-mode heads.
-        let ff1 = DenseLayer::new(backbone_out_dim, units);
-        let ff2 = DenseLayer::new(backbone_out_dim, units);
-        let time_a = DenseLayer::new(backbone_out_dim, units);
-        let time_b = DenseLayer::new(backbone_out_dim, units);
+        let ff1 = DenseLayer::new(backbone_out_dim, units, rng);
+        let ff2 = DenseLayer::new(backbone_out_dim, units, rng);
+        let time_a = DenseLayer::new(backbone_out_dim, units, rng);
+        let time_b = DenseLayer::new(backbone_out_dim, units, rng);
 
         CfcCell {
             config,
@@ -433,10 +466,18 @@ impl CfcNetwork {
     }
 
     /// Creates a new CfC network with custom configuration.
+    ///
+    /// A single [`StdRng`] (seeded from `config.seed`, or from entropy when unseeded) is
+    /// threaded through the cell and then the output projection, so a given seed yields a
+    /// byte-identical network.
     pub fn with_config(input_dim: usize, output_dim: usize, config: CfcConfig) -> Self {
+        let mut rng = match config.seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_entropy(),
+        };
         let hidden_units = config.units;
-        let cell = CfcCell::new(input_dim, config);
-        let output_layer = DenseLayer::new(hidden_units, output_dim);
+        let cell = CfcCell::with_rng(input_dim, config, &mut rng);
+        let output_layer = DenseLayer::new(hidden_units, output_dim, &mut rng);
 
         CfcNetwork {
             cell,
@@ -541,6 +582,12 @@ impl CfcBuilder {
         self
     }
 
+    /// Sets the seed for reproducible random initialization.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = Some(seed);
+        self
+    }
+
     /// Builds the CfC network.
     ///
     /// # Panics
@@ -622,7 +669,8 @@ mod tests {
 
     #[test]
     fn test_dense_layer() {
-        let layer = DenseLayer::new(3, 4);
+        let mut rng = StdRng::seed_from_u64(0);
+        let layer = DenseLayer::new(3, 4, &mut rng);
         assert_eq!(layer.input_dim, 3);
         assert_eq!(layer.output_dim, 4);
 
@@ -632,7 +680,8 @@ mod tests {
 
     #[test]
     fn test_backbone() {
-        let backbone = Backbone::new(10, 16, 2, BackboneActivation::SiLU);
+        let mut rng = StdRng::seed_from_u64(0);
+        let backbone = Backbone::new(10, 16, 2, BackboneActivation::SiLU, &mut rng);
         let output = backbone.forward(&[0.5; 10]);
         assert_eq!(output.len(), 16);
     }
@@ -861,6 +910,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_cfc_seed_reproducible() {
+        // Same seed → byte-identical serialized network (one RNG threaded through the
+        // backbone, both mode's layers, and the output projection).
+        let a = CfcBuilder::new(2, 1).hidden_units(8).seed(99).build();
+        let b = CfcBuilder::new(2, 1).hidden_units(8).seed(99).build();
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_cfc_seed_differs() {
+        let a = CfcBuilder::new(2, 1).hidden_units(8).seed(99).build();
+        let b = CfcBuilder::new(2, 1).hidden_units(8).seed(100).build();
+        assert_ne!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_cfc_unseeded_still_works() {
+        let net = CfcNetwork::new(2, 8, 1);
+        assert_eq!(net.hidden_dim(), 8);
+        assert_eq!(net.output_dim(), 1);
     }
 
     #[test]
