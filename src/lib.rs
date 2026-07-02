@@ -43,7 +43,7 @@
 //! `seed: Option<u64>`, and every builder exposes a `.seed(u64)` method. When a seed is set,
 //! the whole network is constructed from a single [`rand::rngs::StdRng`] seeded with that
 //! value: `StdRng::seed_from_u64(seed)`. When no seed is set, the generator is seeded from
-//! entropy (`StdRng::from_entropy`). A single generator is threaded through every layer in a
+//! the OS RNG (`StdRng::from_os_rng`). A single generator is threaded through every layer in a
 //! fixed order, so two networks built from the same seed are byte-for-byte identical,
 //! including their serialized JSON:
 //!
@@ -65,6 +65,7 @@ pub mod activation;
 pub mod cfc;
 pub mod error;
 pub mod input;
+pub mod layers;
 pub mod lnn;
 pub mod ltc;
 pub mod network_components;
@@ -82,6 +83,7 @@ pub mod prelude {
     // Core LNN
     pub use crate::error::{LnnError, Result};
     pub use crate::input::{read_input_from_csv, validate_inputs};
+    pub use crate::layers::DenseLayer;
     pub use crate::lnn::{
         LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate, NetworkStatistics, ReadoutConfig,
     };
@@ -109,6 +111,7 @@ pub mod prelude {
 // Re-export main types at crate root for convenience
 pub use cfc::{CfcBuilder, CfcCell, CfcConfig, CfcNetwork};
 pub use error::{LnnError, Result};
+pub use layers::DenseLayer;
 pub use lnn::{LiquidNeuralNetwork, LnnBuilder, LnnConfig, LogicGate};
 pub use ltc::{LtcBuilder, LtcCell, LtcConfig, LtcNetwork};
 pub use network_components::{Neuron, Synapse};

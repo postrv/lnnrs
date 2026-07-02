@@ -24,8 +24,10 @@
 //! ```
 
 use crate::activation::tanh;
+use crate::layers::DenseLayer;
+use ndarray::{Array1, Array2, ArrayView1};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for BPTT training.
@@ -108,20 +110,23 @@ impl BpttConfig {
 }
 
 /// Simple dense layer with gradients for training.
+///
+/// Wraps the shared [`DenseLayer`] (parameters + Xavier init + `.dot()` forward) and adds the
+/// gradient and SGD-momentum buffers needed for BPTT. Weights are stored as
+/// `[output_dim, input_dim]` (the `DenseLayer` convention), so the accumulated gradient and
+/// momentum tensors share that shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainableDense {
-    /// Weights [input_dim x output_dim]
-    pub weights: Vec<Vec<f64>>,
-    /// Biases [output_dim]
-    pub bias: Vec<f64>,
-    /// Weight gradients (accumulated)
-    grad_weights: Vec<Vec<f64>>,
-    /// Bias gradients (accumulated)
-    grad_bias: Vec<f64>,
-    /// Weight momentum
-    momentum_weights: Vec<Vec<f64>>,
-    /// Bias momentum
-    momentum_bias: Vec<f64>,
+    /// Parameters (weights `[output_dim, input_dim]`, bias `[output_dim]`).
+    layer: DenseLayer,
+    /// Weight gradients (accumulated), shape `[output_dim, input_dim]`.
+    grad_weights: Array2<f64>,
+    /// Bias gradients (accumulated), shape `[output_dim]`.
+    grad_bias: Array1<f64>,
+    /// Weight momentum, shape `[output_dim, input_dim]`.
+    momentum_weights: Array2<f64>,
+    /// Bias momentum, shape `[output_dim]`.
+    momentum_bias: Array1<f64>,
     /// Input dimension
     pub input_dim: usize,
     /// Output dimension
@@ -135,49 +140,36 @@ impl TrainableDense {
     /// Seeded/reproducible construction goes through [`TrainableDense::with_rng`] so a whole
     /// network can be derived from a single generator.
     pub fn new(input_dim: usize, output_dim: usize) -> Self {
-        let mut rng = StdRng::from_entropy();
+        let mut rng = StdRng::from_os_rng();
         Self::with_rng(input_dim, output_dim, &mut rng)
     }
 
     /// Creates a new trainable dense layer drawing weights from the supplied generator.
     pub fn with_rng(input_dim: usize, output_dim: usize, rng: &mut StdRng) -> Self {
-        let scale = (2.0 / (input_dim + output_dim) as f64).sqrt();
-
-        let weights: Vec<Vec<f64>> = (0..input_dim)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-scale..scale))
-                    .collect()
-            })
-            .collect();
-
-        let bias = vec![0.0; output_dim];
-        let grad_weights = vec![vec![0.0; output_dim]; input_dim];
-        let grad_bias = vec![0.0; output_dim];
-        let momentum_weights = vec![vec![0.0; output_dim]; input_dim];
-        let momentum_bias = vec![0.0; output_dim];
-
         TrainableDense {
-            weights,
-            bias,
-            grad_weights,
-            grad_bias,
-            momentum_weights,
-            momentum_bias,
+            layer: DenseLayer::new(input_dim, output_dim, rng),
+            grad_weights: Array2::zeros((output_dim, input_dim)),
+            grad_bias: Array1::zeros(output_dim),
+            momentum_weights: Array2::zeros((output_dim, input_dim)),
+            momentum_bias: Array1::zeros(output_dim),
             input_dim,
             output_dim,
         }
     }
 
-    /// Forward pass: output = input @ weights + bias
+    /// Returns a reference to the weight matrix (`[output_dim, input_dim]`).
+    pub fn weights(&self) -> &Array2<f64> {
+        &self.layer.weights
+    }
+
+    /// Returns a reference to the bias vector (`[output_dim]`).
+    pub fn bias(&self) -> &Array1<f64> {
+        &self.layer.bias
+    }
+
+    /// Forward pass: `output = W x + b`.
     pub fn forward(&self, input: &[f64]) -> Vec<f64> {
-        let mut output = self.bias.clone();
-        for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for (out, &w) in output.iter_mut().zip(self.weights[i].iter()) {
-                *out += w * inp;
-            }
-        }
-        output
+        self.layer.forward(input)
     }
 
     /// Backward pass: computes gradients and returns input gradient.
@@ -189,76 +181,62 @@ impl TrainableDense {
     /// # Returns
     /// Gradient w.r.t. input
     pub fn backward(&mut self, input: &[f64], grad_output: &[f64]) -> Vec<f64> {
-        // Accumulate weight gradients: dL/dW = input^T @ grad_output
-        for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-                self.grad_weights[i][j] += inp * grad;
+        // Accumulate parameter gradients: dL/dW[j][i] = grad_output[j] * input[i].
+        for (j, &go) in grad_output.iter().enumerate() {
+            self.grad_bias[j] += go;
+            for (i, &xi) in input.iter().enumerate() {
+                self.grad_weights[[j, i]] += xi * go;
             }
         }
 
-        // Accumulate bias gradients
-        for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-            self.grad_bias[j] += grad;
-        }
-
-        // Compute input gradient: dL/dx = grad_output @ W^T
-        let mut grad_input = vec![0.0; self.input_dim];
-        for (i, grad_in) in grad_input.iter_mut().enumerate() {
-            for (j, &grad) in grad_output.iter().enumerate().take(self.output_dim) {
-                *grad_in += self.weights[i][j] * grad;
-            }
-        }
-
-        grad_input
+        // Input gradient: dL/dx = W^T @ grad_output.
+        self.layer
+            .weights
+            .t()
+            .dot(&ArrayView1::from(grad_output))
+            .to_vec()
     }
 
     /// Applies accumulated gradients using SGD with momentum.
     pub fn update(&mut self, config: &BpttConfig) {
-        for i in 0..self.input_dim {
-            for j in 0..self.output_dim {
-                // Add L2 regularization
-                let grad = self.grad_weights[i][j] + config.l2_lambda * self.weights[i][j];
+        for j in 0..self.output_dim {
+            for i in 0..self.input_dim {
+                // Add L2 regularization.
+                let grad =
+                    self.grad_weights[[j, i]] + config.l2_lambda * self.layer.weights[[j, i]];
 
-                // Clip gradient
-                let clipped_grad = if let Some(clip) = config.gradient_clip {
-                    grad.clamp(-clip, clip)
-                } else {
-                    grad
+                // Clip gradient.
+                let clipped_grad = match config.gradient_clip {
+                    Some(clip) => grad.clamp(-clip, clip),
+                    None => grad,
                 };
 
-                // Apply momentum
-                self.momentum_weights[i][j] = config.momentum * self.momentum_weights[i][j]
+                // Apply momentum.
+                self.momentum_weights[[j, i]] = config.momentum * self.momentum_weights[[j, i]]
                     + config.learning_rate * clipped_grad;
 
-                // Update weight
-                self.weights[i][j] -= self.momentum_weights[i][j];
+                // Update weight.
+                self.layer.weights[[j, i]] -= self.momentum_weights[[j, i]];
             }
         }
 
         for j in 0..self.output_dim {
-            let grad = if let Some(clip) = config.gradient_clip {
-                self.grad_bias[j].clamp(-clip, clip)
-            } else {
-                self.grad_bias[j]
+            let grad = match config.gradient_clip {
+                Some(clip) => self.grad_bias[j].clamp(-clip, clip),
+                None => self.grad_bias[j],
             };
 
             self.momentum_bias[j] =
                 config.momentum * self.momentum_bias[j] + config.learning_rate * grad;
 
-            self.bias[j] -= self.momentum_bias[j];
+            self.layer.bias[j] -= self.momentum_bias[j];
         }
     }
 
     /// Zeros accumulated gradients.
     pub fn zero_grad(&mut self) {
-        for i in 0..self.input_dim {
-            for j in 0..self.output_dim {
-                self.grad_weights[i][j] = 0.0;
-            }
-        }
-        for j in 0..self.output_dim {
-            self.grad_bias[j] = 0.0;
-        }
+        self.grad_weights.fill(0.0);
+        self.grad_bias.fill(0.0);
     }
 }
 
@@ -279,7 +257,7 @@ pub struct TrainableRnnCell {
 impl TrainableRnnCell {
     /// Creates a new trainable RNN cell (RNG seeded from entropy).
     pub fn new(input_dim: usize, hidden_dim: usize) -> Self {
-        let mut rng = StdRng::from_entropy();
+        let mut rng = StdRng::from_os_rng();
         Self::with_rng(input_dim, hidden_dim, &mut rng)
     }
 
@@ -404,7 +382,7 @@ impl TrainableRnn {
     ) -> Self {
         let mut rng = match seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_os_rng(),
         };
         let config = BpttConfig {
             seed,
@@ -898,19 +876,17 @@ mod tests {
         layer.backward(&input, &grad_output);
 
         let config = BpttConfig::new(0.1).with_gradient_clip(1.0);
-        let original_weights = layer.weights.clone();
+        let original_weights = layer.weights().clone();
         layer.update(&config);
 
         // Weights should have changed but not by huge amounts due to clipping
-        for (row, orig_row) in layer.weights.iter().zip(original_weights.iter()) {
-            for (w, orig_w) in row.iter().zip(orig_row.iter()) {
-                let diff = (w - orig_w).abs();
-                assert!(
-                    diff < 1.0,
-                    "Weight change {} exceeds expected with clipping",
-                    diff
-                );
-            }
+        for (w, orig_w) in layer.weights().iter().zip(original_weights.iter()) {
+            let diff = (w - orig_w).abs();
+            assert!(
+                diff < 1.0,
+                "Weight change {} exceeds expected with clipping",
+                diff
+            );
         }
     }
 }

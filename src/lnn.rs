@@ -7,9 +7,6 @@
 use crate::error::{LnnError, Result};
 use crate::network_components::{Neuron, Synapse};
 
-use nalgebra::ComplexField;
-use nalgebra::DMatrix;
-use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::ser::SerializeStruct;
@@ -53,64 +50,156 @@ impl LogicGate {
     }
 }
 
-/// Wrapper around the synaptic matrix for custom serialization.
-#[derive(Clone)]
-pub struct SynapsesWrapper(pub Array2<Option<Synapse>>);
+/// Sparse (CSR-style) synaptic connection matrix.
+///
+/// Synapses are stored in compressed-sparse-row form keyed by source neuron: `entries` holds
+/// every synapse sorted by `(source, target)`, and `row_offsets[i]..row_offsets[i + 1]` is
+/// the contiguous run of synapses whose source is neuron `i`. This keeps the reservoir
+/// propagation loop a single pass over `entries` while making per-source lookups O(log row)
+/// and per-target scans O(nnz).
+///
+/// The serialized form is deliberately identical to the previous dense wrapper's sparse
+/// encoding (`{ shape, synapses: [{ row, col, weight, delay, source, target }] }`) so that
+/// existing JSON round-trips unchanged; `Serialize`/`Deserialize` are hand-implemented below.
+#[derive(Clone, Debug)]
+pub struct SynapseMatrix {
+    n: usize,
+    /// CSR row offsets, length `n + 1`.
+    row_offsets: Vec<usize>,
+    /// Synapses sorted by `(source, target)`.
+    entries: Vec<Synapse>,
+}
 
-impl SynapsesWrapper {
-    /// Creates a new empty synapses wrapper with the given dimensions.
-    pub fn new(rows: usize, cols: usize) -> Self {
-        SynapsesWrapper(Array2::default((rows, cols)))
-    }
-
-    /// Returns the shape of the synaptic matrix.
-    pub fn shape(&self) -> (usize, usize) {
-        let shape = self.0.shape();
-        (shape[0], shape[1])
-    }
-
-    /// Gets a synapse at the given indices, if it exists.
-    pub fn get(&self, i: usize, j: usize) -> Option<&Synapse> {
-        self.0.get((i, j)).and_then(|opt| opt.as_ref())
-    }
-
-    /// Sets a synapse at the given indices.
-    pub fn set(&mut self, i: usize, j: usize, synapse: Option<Synapse>) {
-        if let Some(cell) = self.0.get_mut((i, j)) {
-            *cell = synapse;
+impl SynapseMatrix {
+    /// Creates an empty `n x n` synaptic matrix.
+    pub fn new(n: usize) -> Self {
+        SynapseMatrix {
+            n,
+            row_offsets: vec![0; n + 1],
+            entries: Vec::new(),
         }
     }
 
-    /// Iterates over all synapses (non-None values).
+    /// Builds a matrix from entries already sorted by `(source, target)`.
+    fn from_sorted(n: usize, entries: Vec<Synapse>) -> Self {
+        let mut row_offsets = vec![0usize; n + 1];
+        for e in &entries {
+            row_offsets[e.source + 1] += 1;
+        }
+        for i in 0..n {
+            row_offsets[i + 1] += row_offsets[i];
+        }
+        SynapseMatrix {
+            n,
+            row_offsets,
+            entries,
+        }
+    }
+
+    /// Returns the `(rows, cols)` shape (always square).
+    pub fn shape(&self) -> (usize, usize) {
+        (self.n, self.n)
+    }
+
+    /// Number of synapses stored.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the matrix holds no synapses.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the synapse from `source` to `target`, if present.
+    pub fn get(&self, source: usize, target: usize) -> Option<&Synapse> {
+        if source >= self.n {
+            return None;
+        }
+        let (start, end) = (self.row_offsets[source], self.row_offsets[source + 1]);
+        self.entries[start..end]
+            .binary_search_by(|e| e.target.cmp(&target))
+            .ok()
+            .map(|pos| &self.entries[start + pos])
+    }
+
+    /// Inserts (or replaces) a synapse, keyed by its `source`/`target`.
+    pub fn insert(&mut self, synapse: Synapse) {
+        let source = synapse.source;
+        let (start, end) = (self.row_offsets[source], self.row_offsets[source + 1]);
+        match self.entries[start..end].binary_search_by(|e| e.target.cmp(&synapse.target)) {
+            Ok(pos) => self.entries[start + pos] = synapse,
+            Err(pos) => {
+                self.entries.insert(start + pos, synapse);
+                // Every row after `source` shifts right by one.
+                for offset in self.row_offsets[source + 1..].iter_mut() {
+                    *offset += 1;
+                }
+            }
+        }
+    }
+
+    /// Removes the synapse from `source` to `target`; returns whether one existed.
+    pub fn remove(&mut self, source: usize, target: usize) -> bool {
+        if source >= self.n {
+            return false;
+        }
+        let (start, end) = (self.row_offsets[source], self.row_offsets[source + 1]);
+        if let Ok(pos) = self.entries[start..end].binary_search_by(|e| e.target.cmp(&target)) {
+            self.entries.remove(start + pos);
+            for offset in self.row_offsets[source + 1..].iter_mut() {
+                *offset -= 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sets or clears the synapse at `(source, target)`.
+    pub fn set(&mut self, source: usize, target: usize, synapse: Option<Synapse>) {
+        match synapse {
+            Some(s) => self.insert(s),
+            None => {
+                self.remove(source, target);
+            }
+        }
+    }
+
+    /// Synapses whose source is `source` (sorted by target).
+    pub fn row(&self, source: usize) -> &[Synapse] {
+        if source >= self.n {
+            return &[];
+        }
+        &self.entries[self.row_offsets[source]..self.row_offsets[source + 1]]
+    }
+
+    /// Iterates over every synapse, ordered by `(source, target)`.
     pub fn iter_synapses(&self) -> impl Iterator<Item = &Synapse> {
-        self.0.iter().filter_map(|opt| opt.as_ref())
+        self.entries.iter()
     }
 }
 
-impl Serialize for SynapsesWrapper {
+impl Serialize for SynapseMatrix {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_struct("SynapsesWrapper", 2)?;
+        let mut s = serializer.serialize_struct("SynapseMatrix", 2)?;
+        s.serialize_field("shape", &[self.n, self.n])?;
 
-        // Store dimensions
-        let shape = self.0.shape();
-        s.serialize_field("shape", &[shape[0], shape[1]])?;
-
-        // Serialize synapse data as sparse representation
+        // Sparse representation, ordered by (source, target) exactly as stored. `row`/`col`
+        // mirror `source`/`target` so the JSON matches the previous dense-wrapper encoding.
         let synapse_data: Vec<SynapseData> = self
-            .0
-            .indexed_iter()
-            .filter_map(|((row, col), syn_opt)| {
-                syn_opt.as_ref().map(|s| SynapseData {
-                    row,
-                    col,
-                    weight: s.weight,
-                    delay: s.delay,
-                    source: s.source,
-                    target: s.target,
-                })
+            .entries
+            .iter()
+            .map(|syn| SynapseData {
+                row: syn.source,
+                col: syn.target,
+                weight: syn.weight,
+                delay: syn.delay,
+                source: syn.source,
+                target: syn.target,
             })
             .collect();
 
@@ -130,30 +219,29 @@ struct SynapseData {
     target: usize,
 }
 
-impl<'de> Deserialize<'de> for SynapsesWrapper {
+impl<'de> Deserialize<'de> for SynapseMatrix {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct SynapsesWrapperData {
+        struct SynapseMatrixData {
             shape: [usize; 2],
             synapses: Vec<SynapseData>,
         }
 
-        let data = SynapsesWrapperData::deserialize(deserializer)?;
-        let mut array: Array2<Option<Synapse>> = Array2::default((data.shape[0], data.shape[1]));
+        let data = SynapseMatrixData::deserialize(deserializer)?;
+        let n = data.shape[0];
 
-        for syn_data in data.synapses {
-            array[[syn_data.row, syn_data.col]] = Some(Synapse::new(
-                syn_data.source,
-                syn_data.target,
-                syn_data.weight,
-                syn_data.delay,
-            ));
-        }
+        let mut entries: Vec<Synapse> = data
+            .synapses
+            .into_iter()
+            .map(|d| Synapse::new(d.source, d.target, d.weight, d.delay))
+            .collect();
+        // Enforce CSR ordering regardless of the order the entries appear in the JSON.
+        entries.sort_by(|a, b| a.source.cmp(&b.source).then(a.target.cmp(&b.target)));
 
-        Ok(SynapsesWrapper(array))
+        Ok(SynapseMatrix::from_sorted(n, entries))
     }
 }
 
@@ -429,13 +517,64 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>
     Some(x)
 }
 
+/// Estimates the spectral radius (dominant eigenvalue magnitude) of an `n x n` linear
+/// operator via power iteration.
+///
+/// `matvec` computes `A x`. Iteration starts from a seeded deterministic vector, runs up to
+/// 1000 iterations, and stops early once the magnitude estimate changes by less than `1e-10`.
+/// A zero (or nilpotent) operator collapses the iterate toward zero and returns `0.0`, which
+/// is the correct spectral radius in those cases. Power iteration tracks the dominant
+/// eigenvalue *magnitude*, so defective/nilpotent matrices such as `[[0, 2], [0, 0]]`
+/// correctly report `0`.
+fn power_iteration_spectral_radius<F>(n: usize, matvec: F) -> f64
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    if n == 0 {
+        return 0.0;
+    }
+
+    // Deterministic pseudo-random start vector: reproducible across runs and vanishingly
+    // unlikely to be orthogonal to the dominant eigenvector (which an all-ones start can be).
+    let mut rng = StdRng::seed_from_u64(0x5EED_1E55);
+    let mut v: Vec<f64> = (0..n).map(|_| rng.random_range(-1.0..1.0)).collect();
+    let norm0 = l2_norm(&v);
+    if norm0 > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm0;
+        }
+    }
+
+    let mut lambda = 0.0;
+    for _ in 0..1000 {
+        let w = matvec(&v);
+        let norm = l2_norm(&w);
+        if norm < 1e-12 {
+            return 0.0; // A v -> 0: zero / nilpotent dominant behaviour.
+        }
+        for (vi, wi) in v.iter_mut().zip(w.iter()) {
+            *vi = wi / norm;
+        }
+        if (norm - lambda).abs() < 1e-10 {
+            return norm;
+        }
+        lambda = norm;
+    }
+    lambda
+}
+
+/// Euclidean (L2) norm of a vector.
+fn l2_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
 /// Represents the entire Liquid Neural Network.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LiquidNeuralNetwork {
     /// All neurons in the network
     pub neurons: Vec<Neuron>,
-    /// Synaptic connection matrix
-    synapses: SynapsesWrapper,
+    /// Synaptic connection matrix (sparse CSR)
+    synapses: SynapseMatrix,
     /// Indices of neurons designated as inputs
     input_indices: Vec<usize>,
     /// Indices of neurons designated as outputs
@@ -466,7 +605,7 @@ impl LiquidNeuralNetwork {
     pub fn from_config(config: LnnConfig) -> Self {
         let mut rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_os_rng(),
         };
         let neuron_count = config.neuron_count;
 
@@ -476,26 +615,27 @@ impl LiquidNeuralNetwork {
             .map(|i| {
                 Neuron::with_id(
                     i,
-                    rng.gen_range(config.threshold_range.0..=config.threshold_range.1),
+                    rng.random_range(config.threshold_range.0..=config.threshold_range.1),
                 )
             })
             .collect();
 
-        // Initialize synapses (inclusive range sampling for weight/delay).
-        let mut synapses_array = Array2::default((neuron_count, neuron_count));
+        // Initialize synapses (inclusive range sampling for weight/delay). Entries are pushed
+        // in (source, target) order so the CSR structure is already sorted.
+        let mut entries: Vec<Synapse> = Vec::new();
         for i in 0..neuron_count {
             for j in 0..neuron_count {
-                if i != j && rng.gen::<f64>() < config.connection_probability {
-                    let weight = rng.gen_range(config.weight_range.0..=config.weight_range.1);
-                    let delay = rng.gen_range(config.delay_range.0..=config.delay_range.1);
-                    synapses_array[[i, j]] = Some(Synapse::new(i, j, weight, delay));
+                if i != j && rng.random::<f64>() < config.connection_probability {
+                    let weight = rng.random_range(config.weight_range.0..=config.weight_range.1);
+                    let delay = rng.random_range(config.delay_range.0..=config.delay_range.1);
+                    entries.push(Synapse::new(i, j, weight, delay));
                 }
             }
         }
 
         let mut network = LiquidNeuralNetwork {
             neurons,
-            synapses: SynapsesWrapper(synapses_array),
+            synapses: SynapseMatrix::from_sorted(neuron_count, entries),
             input_indices: Vec::new(),
             output_indices: Vec::new(),
             readout_weights: Vec::new(),
@@ -521,33 +661,20 @@ impl LiquidNeuralNetwork {
 
     /// Prints information about all synapses in the network.
     pub fn print_synapses(&self) {
-        for (i, row) in self.synapses.0.outer_iter().enumerate() {
-            for (j, synapse_option) in row.iter().enumerate() {
-                if let Some(synapse) = synapse_option {
-                    log::info!(
-                        "Synapse from neuron {} to neuron {}: weight = {:.4}, delay = {}",
-                        i,
-                        j,
-                        synapse.weight,
-                        synapse.delay
-                    );
-                }
-            }
+        for synapse in self.synapses.iter_synapses() {
+            log::info!(
+                "Synapse from neuron {} to neuron {}: weight = {:.4}, delay = {}",
+                synapse.source,
+                synapse.target,
+                synapse.weight,
+                synapse.delay
+            );
         }
     }
 
     /// Retrieves all synapses connected to a specific neuron (where it's the source).
     pub fn get_synapses_for_neuron(&self, neuron_idx: usize) -> Vec<Synapse> {
-        if neuron_idx >= self.neurons.len() {
-            return Vec::new();
-        }
-
-        self.synapses
-            .0
-            .index_axis(ndarray::Axis(0), neuron_idx)
-            .iter()
-            .filter_map(|synapse_opt| synapse_opt.clone())
-            .collect()
+        self.synapses.row(neuron_idx).to_vec()
     }
 
     /// Retrieves all synapses targeting a specific neuron.
@@ -557,10 +684,9 @@ impl LiquidNeuralNetwork {
         }
 
         self.synapses
-            .0
-            .index_axis(ndarray::Axis(1), neuron_idx)
-            .iter()
-            .filter_map(|synapse_opt| synapse_opt.clone())
+            .iter_synapses()
+            .filter(|s| s.target == neuron_idx)
+            .cloned()
             .collect()
     }
 
@@ -574,32 +700,20 @@ impl LiquidNeuralNetwork {
             return;
         }
 
-        // Extract weights into a matrix using a simple loop
-        let mut weights = Vec::with_capacity(neuron_count * neuron_count);
-        for i in 0..neuron_count {
-            for j in 0..neuron_count {
-                let weight = self.synapses.0[[i, j]]
-                    .as_ref()
-                    .map(|s| s.weight)
-                    .unwrap_or(0.0);
-                weights.push(weight);
+        // Estimate the current spectral radius by power iteration on the sparse weight
+        // operator `(A x)[target] += weight * x[source]`. The transpose has identical
+        // eigenvalue magnitudes, so this matches the previous dense eigen-decomposition.
+        let rho = power_iteration_spectral_radius(neuron_count, |x| {
+            let mut y = vec![0.0; neuron_count];
+            for s in self.synapses.iter_synapses() {
+                y[s.target] += s.weight * x[s.source];
             }
-        }
+            y
+        });
 
-        let matrix = DMatrix::from_vec(neuron_count, neuron_count, weights);
-
-        // Compute eigenvalues and find maximum magnitude
-        let eigenvalues = matrix.complex_eigenvalues();
-        let max_eigenvalue_magnitude = eigenvalues
-            .iter()
-            .map(|ev| ev.modulus())
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        if max_eigenvalue_magnitude > 0.0 && max_eigenvalue_magnitude.is_finite() {
-            let scaling_factor = spectral_radius / max_eigenvalue_magnitude;
-
-            // Scale all synapse weights
-            for synapse in self.synapses.0.iter_mut().flatten() {
+        if rho > 0.0 && rho.is_finite() {
+            let scaling_factor = spectral_radius / rho;
+            for synapse in self.synapses.entries.iter_mut() {
                 synapse.weight *= scaling_factor;
             }
         }
@@ -611,37 +725,21 @@ impl LiquidNeuralNetwork {
     pub fn initialize_synapses(&mut self, spectral_radius: f64) {
         let neuron_count = self.neurons.len();
         // This is an explicit re-randomization with no seed context; draw from entropy.
-        let mut rng = StdRng::from_entropy();
+        let mut rng = StdRng::from_os_rng();
 
-        // Generate random weights
-        let raw_weights: Vec<f64> = (0..neuron_count * neuron_count)
-            .map(|_| rng.gen_range(-1.0..1.0))
-            .collect();
-
-        // Create matrix and compute spectral radius
-        let mut matrix = DMatrix::from_vec(neuron_count, neuron_count, raw_weights);
-        let eigenvalues = matrix.complex_eigenvalues();
-        let max_eigenvalue_magnitude = eigenvalues
-            .iter()
-            .map(|ev| ev.modulus())
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        if max_eigenvalue_magnitude > 0.0 && max_eigenvalue_magnitude.is_finite() {
-            let scaling_factor = spectral_radius / max_eigenvalue_magnitude;
-            matrix *= scaling_factor;
+        // Generate a fully-connected (minus self-loops) random reservoir in CSR order.
+        let mut entries: Vec<Synapse> = Vec::new();
+        for i in 0..neuron_count {
+            for j in 0..neuron_count {
+                if i != j {
+                    let weight = rng.random_range(-1.0..1.0);
+                    entries.push(Synapse::new(i, j, weight, DEFAULT_DELAY));
+                }
+            }
         }
 
-        // Create synapses from scaled matrix
-        let synapses_array: Array2<Option<Synapse>> =
-            Array2::from_shape_fn((neuron_count, neuron_count), |(i, j)| {
-                if i != j {
-                    Some(Synapse::new(i, j, matrix[(i, j)], DEFAULT_DELAY))
-                } else {
-                    None
-                }
-            });
-
-        self.synapses = SynapsesWrapper(synapses_array);
+        self.synapses = SynapseMatrix::from_sorted(neuron_count, entries);
+        self.scale_to_spectral_radius(spectral_radius);
     }
 
     /// Sets the indices of neurons that will act as the input interface.
@@ -710,7 +808,8 @@ impl LiquidNeuralNetwork {
             return Err(LnnError::configuration("Synaptic delay must be >= 1"));
         }
 
-        self.synapses.0[[pre_idx, post_idx]] = Some(Synapse::new(pre_idx, post_idx, weight, delay));
+        self.synapses
+            .insert(Synapse::new(pre_idx, post_idx, weight, delay));
         Ok(())
     }
 
@@ -723,7 +822,7 @@ impl LiquidNeuralNetwork {
             ));
         }
 
-        self.synapses.0[[pre_idx, post_idx]] = None;
+        self.synapses.remove(pre_idx, post_idx);
         Ok(())
     }
 
@@ -911,7 +1010,7 @@ impl LiquidNeuralNetwork {
     /// zero rest potential, zero bias and no threshold adaptation.
     fn reset_to_blank_gate(&mut self) {
         let n = self.neurons.len();
-        self.synapses = SynapsesWrapper::new(n, n);
+        self.synapses = SynapseMatrix::new(n);
         self.input_indices.clear();
         self.output_indices.clear();
         for neuron in &mut self.neurons {
@@ -1114,7 +1213,7 @@ impl LiquidNeuralNetwork {
 
     /// Returns network statistics for debugging and analysis.
     pub fn statistics(&self) -> NetworkStatistics {
-        let total_synapses = self.synapses.0.iter().filter(|s| s.is_some()).count();
+        let total_synapses = self.synapses.len();
         let excitatory_count = self
             .synapses
             .iter_synapses()
@@ -1475,20 +1574,46 @@ mod tests {
         use super::*;
 
         #[test]
-        fn test_synapses_wrapper_serialization() {
-            let mut wrapper = SynapsesWrapper::new(3, 3);
-            wrapper.set(0, 1, Some(Synapse::new(0, 1, 0.5, 2)));
-            wrapper.set(1, 2, Some(Synapse::new(1, 2, -0.3, 1)));
+        fn test_synapse_matrix_serialization() {
+            let mut matrix = SynapseMatrix::new(3);
+            matrix.set(0, 1, Some(Synapse::new(0, 1, 0.5, 2)));
+            matrix.set(1, 2, Some(Synapse::new(1, 2, -0.3, 1)));
 
-            let json = serde_json::to_string(&wrapper).unwrap();
-            let deserialized: SynapsesWrapper = serde_json::from_str(&json).unwrap();
+            let json = serde_json::to_string(&matrix).unwrap();
+            let deserialized: SynapseMatrix = serde_json::from_str(&json).unwrap();
 
-            assert_eq!(wrapper.shape(), deserialized.shape());
+            assert_eq!(matrix.shape(), deserialized.shape());
+            assert_eq!(matrix.len(), deserialized.len());
 
-            let orig_syn = wrapper.get(0, 1).unwrap();
+            let orig_syn = matrix.get(0, 1).unwrap();
             let deser_syn = deserialized.get(0, 1).unwrap();
             assert_eq!(orig_syn.weight, deser_syn.weight);
             assert_eq!(orig_syn.delay, deser_syn.delay);
+        }
+
+        #[test]
+        fn test_synapse_matrix_insert_replace_remove() {
+            // Insertions keep entries sorted; replacing an existing edge overwrites in place;
+            // removals shrink the row and update offsets so other rows stay queryable.
+            let mut m = SynapseMatrix::new(4);
+            m.insert(Synapse::new(0, 3, 1.0, 1));
+            m.insert(Synapse::new(0, 1, 2.0, 1));
+            m.insert(Synapse::new(2, 1, 3.0, 1));
+            assert_eq!(m.len(), 3);
+            // Row 0 sorted by target.
+            let row0: Vec<usize> = m.row(0).iter().map(|s| s.target).collect();
+            assert_eq!(row0, vec![1, 3]);
+            // Replace (0,1).
+            m.insert(Synapse::new(0, 1, 9.0, 2));
+            assert_eq!(m.len(), 3);
+            assert_eq!(m.get(0, 1).unwrap().weight, 9.0);
+            assert_eq!(m.get(2, 1).unwrap().weight, 3.0);
+            // Remove (0,3): row 2 must remain intact.
+            assert!(m.remove(0, 3));
+            assert!(!m.remove(0, 3));
+            assert_eq!(m.len(), 2);
+            assert!(m.get(0, 3).is_none());
+            assert_eq!(m.get(2, 1).unwrap().weight, 3.0);
         }
 
         #[test]
@@ -1655,7 +1780,7 @@ mod tests {
         /// that AND becomes linearly solvable from the collected state.
         fn deterministic_reservoir() -> LiquidNeuralNetwork {
             let mut lnn = LiquidNeuralNetwork::new(6);
-            lnn.synapses = SynapsesWrapper::new(6, 6);
+            lnn.synapses = SynapseMatrix::new(6);
             lnn.set_input_neurons(vec![0, 1]);
             for n in &mut lnn.neurons {
                 n.reset();
@@ -1699,6 +1824,82 @@ mod tests {
             }
             let mse = sq_err / inputs.len() as f64;
             assert!(mse < 1e-2, "train MSE too high: {mse}");
+        }
+    }
+
+    mod spectral_radius_tests {
+        use super::*;
+
+        /// Builds a dense-matrix matvec closure for testing the power-iteration helper.
+        fn dense_matvec(a: Vec<Vec<f64>>) -> impl Fn(&[f64]) -> Vec<f64> {
+            move |x: &[f64]| {
+                a.iter()
+                    .map(|row| row.iter().zip(x.iter()).map(|(w, xi)| w * xi).sum())
+                    .collect()
+            }
+        }
+
+        #[test]
+        fn test_power_iteration_diag() {
+            // diag(1, 3) has dominant eigenvalue magnitude 3.
+            let rho = power_iteration_spectral_radius(
+                2,
+                dense_matvec(vec![vec![1.0, 0.0], vec![0.0, 3.0]]),
+            );
+            assert!((rho - 3.0).abs() < 1e-6, "expected 3, got {rho}");
+        }
+
+        #[test]
+        fn test_power_iteration_dense_4x4() {
+            // Block-diagonal: the 2x2 block [[2,1],[1,2]] has eigenvalues 3 and 1, so the whole
+            // matrix's dominant eigenvalue magnitude is 3.
+            let a = vec![
+                vec![2.0, 1.0, 0.0, 0.0],
+                vec![1.0, 2.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 0.0, 0.5],
+            ];
+            let rho = power_iteration_spectral_radius(4, dense_matvec(a));
+            assert!((rho - 3.0).abs() < 1e-6, "expected 3, got {rho}");
+        }
+
+        #[test]
+        fn test_power_iteration_zero_matrix() {
+            let rho = power_iteration_spectral_radius(3, |_x| vec![0.0; 3]);
+            assert_eq!(rho, 0.0);
+        }
+
+        #[test]
+        fn test_power_iteration_nilpotent() {
+            // [[0, 2], [0, 0]] is nilpotent: true spectral radius is 0, and power iteration
+            // reports ~0 (documented behaviour).
+            let rho = power_iteration_spectral_radius(
+                2,
+                dense_matvec(vec![vec![0.0, 2.0], vec![0.0, 0.0]]),
+            );
+            assert!(rho < 1e-6, "nilpotent matrix should give ~0, got {rho}");
+        }
+
+        #[test]
+        fn test_scale_to_spectral_radius_achieves_target() {
+            // A hand-built 4-neuron cycle 0->1->2->3->0 with unit weights has spectral radius
+            // 1; scaling to a target must make the estimated radius match the target.
+            let mut lnn = LiquidNeuralNetwork::new(4);
+            lnn.reset_to_blank_gate();
+            for i in 0..4 {
+                lnn.connect_neurons(i, (i + 1) % 4, 1.0, 1).unwrap();
+            }
+            lnn.scale_to_spectral_radius(0.5);
+
+            let n = lnn.neurons.len();
+            let rho = power_iteration_spectral_radius(n, |x| {
+                let mut y = vec![0.0; n];
+                for s in lnn.synapses.iter_synapses() {
+                    y[s.target] += s.weight * x[s.source];
+                }
+                y
+            });
+            assert!((rho - 0.5).abs() < 1e-6, "expected 0.5, got {rho}");
         }
     }
 

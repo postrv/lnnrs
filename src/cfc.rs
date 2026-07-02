@@ -35,8 +35,10 @@
 
 use crate::activation::{sigmoid, tanh};
 use crate::error::{LnnError, Result};
+use crate::layers::DenseLayer;
+use ndarray::Array1;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for CfC layers.
@@ -165,53 +167,10 @@ impl CfcConfig {
     }
 }
 
-/// Dense layer for the backbone network.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DenseLayer {
-    weights: Vec<Vec<f64>>,
-    bias: Vec<f64>,
-    input_dim: usize,
-    output_dim: usize,
-}
-
-impl DenseLayer {
-    /// Creates a dense layer with Xavier-initialised weights drawn from `rng`.
-    ///
-    /// The generator is borrowed (never created here) so that every layer of a network is
-    /// derived from the single seeded generator owned by the network constructor.
-    fn new(input_dim: usize, output_dim: usize, rng: &mut StdRng) -> Self {
-        let scale = (2.0 / (input_dim + output_dim) as f64).sqrt();
-
-        let weights: Vec<Vec<f64>> = (0..input_dim)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-scale..scale))
-                    .collect()
-            })
-            .collect();
-
-        let bias = vec![0.0; output_dim];
-
-        DenseLayer {
-            weights,
-            bias,
-            input_dim,
-            output_dim,
-        }
-    }
-
-    fn forward(&self, input: &[f64]) -> Vec<f64> {
-        let mut output = self.bias.clone();
-        for (i, &inp) in input.iter().enumerate().take(self.input_dim) {
-            for (out, &w) in output.iter_mut().zip(self.weights[i].iter()) {
-                *out += w * inp;
-            }
-        }
-        output
-    }
-}
-
 /// Backbone MLP network that processes concatenated [state, input].
+///
+/// Layers are the shared [`DenseLayer`]; the forward pass runs entirely on
+/// [`ndarray::Array1`] so each layer is an `.dot()` matrix-vector product.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Backbone {
     layers: Vec<DenseLayer>,
@@ -239,20 +198,22 @@ impl Backbone {
         Backbone { layers, activation }
     }
 
-    fn forward(&self, input: &[f64]) -> Vec<f64> {
-        let mut x = input.to_vec();
+    /// Runs the backbone on an [`Array1`] input, applying the activation to every layer but
+    /// the last.
+    fn forward_arr(&self, input: Array1<f64>) -> Array1<f64> {
+        let mut x = input;
+        let last = self.layers.len() - 1;
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x);
-            // Apply activation to all but the last layer
-            if i < self.layers.len() - 1 {
-                x = x.iter().map(|&v| self.activation.apply(v)).collect();
+            x = layer.forward_arr(x.view());
+            if i < last {
+                x.mapv_inplace(|v| self.activation.apply(v));
             }
         }
         x
     }
 
     fn output_dim(&self) -> usize {
-        self.layers.last().map(|l| l.output_dim).unwrap_or(0)
+        self.layers.last().map(|l| l.output_dim()).unwrap_or(0)
     }
 }
 
@@ -300,7 +261,7 @@ impl CfcCell {
     pub fn new(input_dim: usize, config: CfcConfig) -> Self {
         let mut rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_os_rng(),
         };
         Self::with_rng(input_dim, config, &mut rng)
     }
@@ -357,14 +318,11 @@ impl CfcCell {
     }
 
     /// Computes time constants from backbone features.
-    fn compute_tau(&self, backbone_features: &[f64]) -> Vec<f64> {
-        let tau_logits = self.tau_layer.forward(backbone_features);
-        tau_logits
-            .iter()
-            .map(|&logit| {
-                self.config.tau_min + (self.config.tau_max - self.config.tau_min) * sigmoid(logit)
-            })
-            .collect()
+    fn compute_tau(&self, backbone_features: &Array1<f64>) -> Array1<f64> {
+        let (tau_min, tau_max) = (self.config.tau_min, self.config.tau_max);
+        self.tau_layer
+            .forward_arr(backbone_features.view())
+            .mapv(|logit| tau_min + (tau_max - tau_min) * sigmoid(logit))
     }
 
     /// Performs one forward pass.
@@ -377,47 +335,30 @@ impl CfcCell {
     /// `x_new = x * exp(-dt/tau) + (1 - exp(-dt/tau)) * f(z)`.
     pub fn forward(&self, state: &[f64], input: &[f64], dt: f64) -> Vec<f64> {
         // Concatenate state and input for the backbone.
-        let mut combined = state.to_vec();
+        let mut combined = Vec::with_capacity(state.len() + input.len());
+        combined.extend_from_slice(state);
         combined.extend_from_slice(input);
 
         // Compute backbone features z = backbone([state, input]).
-        let features = self.backbone.forward(&combined);
+        let features = self.backbone.forward_arr(Array1::from(combined));
 
         if self.config.no_gate {
             // Decay (pure) mode: closed-form exponential decay toward f(z) = tanh(W z + b).
             let tau = self.compute_tau(&features);
-            let ff: Vec<f64> = self
-                .ff_projection
-                .forward(&features)
-                .iter()
-                .map(|&x| tanh(x))
-                .collect();
+            let ff = self.ff_projection.forward_arr(features.view()).mapv(tanh);
 
-            state
-                .iter()
-                .zip(ff.iter())
-                .zip(tau.iter())
-                .map(|((&x, &f), &t)| {
-                    let decay = (-dt / t).exp();
-                    x * decay + (1.0 - decay) * f
+            (0..self.config.units)
+                .map(|i| {
+                    let decay = (-dt / tau[i]).exp();
+                    state[i] * decay + (1.0 - decay) * ff[i]
                 })
                 .collect()
         } else {
             // Gated (default) mode: interpolate two tanh heads with a time-dependent gate.
-            let ff1: Vec<f64> = self
-                .ff1
-                .forward(&features)
-                .iter()
-                .map(|&x| tanh(x))
-                .collect();
-            let ff2: Vec<f64> = self
-                .ff2
-                .forward(&features)
-                .iter()
-                .map(|&x| tanh(x))
-                .collect();
-            let t_a = self.time_a.forward(&features);
-            let t_b = self.time_b.forward(&features);
+            let ff1 = self.ff1.forward_arr(features.view()).mapv(tanh);
+            let ff2 = self.ff2.forward_arr(features.view()).mapv(tanh);
+            let t_a = self.time_a.forward_arr(features.view());
+            let t_b = self.time_b.forward_arr(features.view());
 
             (0..self.config.units)
                 .map(|i| {
@@ -473,7 +414,7 @@ impl CfcNetwork {
     pub fn with_config(input_dim: usize, output_dim: usize, config: CfcConfig) -> Self {
         let mut rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_os_rng(),
         };
         let hidden_units = config.units;
         let cell = CfcCell::with_rng(input_dim, config, &mut rng);
@@ -499,7 +440,7 @@ impl CfcNetwork {
 
     /// Returns the output dimension.
     pub fn output_dim(&self) -> usize {
-        self.output_layer.output_dim
+        self.output_layer.output_dim()
     }
 
     /// Processes a single input.
@@ -668,21 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_layer() {
-        let mut rng = StdRng::seed_from_u64(0);
-        let layer = DenseLayer::new(3, 4, &mut rng);
-        assert_eq!(layer.input_dim, 3);
-        assert_eq!(layer.output_dim, 4);
-
-        let output = layer.forward(&[1.0, 0.5, 0.2]);
-        assert_eq!(output.len(), 4);
-    }
-
-    #[test]
     fn test_backbone() {
         let mut rng = StdRng::seed_from_u64(0);
         let backbone = Backbone::new(10, 16, 2, BackboneActivation::SiLU, &mut rng);
-        let output = backbone.forward(&[0.5; 10]);
+        let output = backbone.forward_arr(Array1::from(vec![0.5; 10]));
         assert_eq!(output.len(), 16);
     }
 
@@ -854,7 +784,7 @@ mod tests {
         let mut combined = state.clone();
         combined.extend_from_slice(&input);
 
-        let features = cell.backbone.forward(&combined);
+        let features = cell.backbone.forward_arr(Array1::from(combined));
         let tau = cell.compute_tau(&features);
 
         // All time constants should be in range

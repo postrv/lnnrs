@@ -16,7 +16,9 @@
 
 use crate::activation::{sigmoid, tanh};
 use crate::error::{LnnError, Result};
+use crate::layers::DenseLayer;
 use crate::ode_solver::{OdeSolver, OdeState, OdeSystem, RungeKutta4};
+use ndarray::ArrayView1;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -122,12 +124,11 @@ impl LtcConfig {
 pub struct LtcCell {
     /// Configuration
     pub config: LtcConfig,
-    /// Input weights [input_dim x units]
-    pub w_in: Vec<Vec<f64>>,
-    /// Recurrent weights [units x units]
-    pub w_rec: Vec<Vec<f64>>,
-    /// Bias terms [units]
-    pub bias: Vec<f64>,
+    /// Input projection `W_in` (`input_dim -> units`). Its bias doubles as the cell bias
+    /// (added once to the pre-activation), replacing the former separate `bias` field.
+    pub w_in: DenseLayer,
+    /// Recurrent projection `W_rec` (`units -> units`); its bias is zero.
+    pub w_rec: DenseLayer,
     /// Time constant weights (for input-dependent tau) [units]
     pub tau_weights: Vec<f64>,
     /// Time constant bias [units]
@@ -146,7 +147,7 @@ impl LtcCell {
     pub fn new(input_dim: usize, config: LtcConfig) -> Self {
         let mut rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_os_rng(),
         };
         Self::with_rng(input_dim, config, &mut rng)
     }
@@ -159,35 +160,19 @@ impl LtcCell {
     pub fn with_rng(input_dim: usize, config: LtcConfig, rng: &mut StdRng) -> Self {
         let units = config.units;
 
-        // Xavier/Glorot initialization
-        let in_scale = (2.0 / (input_dim + units) as f64).sqrt();
-        let rec_scale = (2.0 / (units + units) as f64).sqrt();
+        // Xavier/Glorot initialization via the shared layer. `DenseLayer::new` uses
+        // `scale = sqrt(2 / (in + out))`, which reproduces the previous `in_scale`/`rec_scale`
+        // exactly. The cell bias is `w_in`'s (zero-initialised) bias.
+        let w_in = DenseLayer::new(input_dim, units, rng);
+        let w_rec = DenseLayer::new(units, units, rng);
 
-        let w_in: Vec<Vec<f64>> = (0..input_dim)
-            .map(|_| {
-                (0..units)
-                    .map(|_| rng.gen_range(-in_scale..in_scale))
-                    .collect()
-            })
-            .collect();
-
-        let w_rec: Vec<Vec<f64>> = (0..units)
-            .map(|_| {
-                (0..units)
-                    .map(|_| rng.gen_range(-rec_scale..rec_scale))
-                    .collect()
-            })
-            .collect();
-
-        let bias = vec![0.0; units];
-        let tau_weights = (0..units).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let tau_weights = (0..units).map(|_| rng.random_range(-0.5..0.5)).collect();
         let tau_bias = vec![config.tau_base.ln(); units];
 
         LtcCell {
             config,
             w_in,
             w_rec,
-            bias,
             tau_weights,
             tau_bias,
             input_dim,
@@ -220,29 +205,16 @@ impl LtcCell {
             .collect()
     }
 
-    /// Computes the pre-activation: W_in * input + W_rec * state + bias
-    fn pre_activation(&self, state: &[f64], input: &[f64]) -> Vec<f64> {
-        let mut result = self.bias.clone();
-
-        // Input contribution: W_in * input
-        for (i, &inp) in input.iter().enumerate() {
-            if i < self.w_in.len() {
-                for (r, &w) in result.iter_mut().zip(self.w_in[i].iter()) {
-                    *r += w * inp;
-                }
-            }
-        }
-
-        // Recurrent contribution: W_rec * state
-        for (i, &s) in state.iter().enumerate() {
-            if i < self.w_rec.len() {
-                for (r, &w) in result.iter_mut().zip(self.w_rec[i].iter()) {
-                    *r += w * s;
-                }
-            }
-        }
-
-        result
+    /// Computes the pre-activation: `W_in * input + W_rec * state + bias`.
+    ///
+    /// The cell bias is carried by `w_in` (`w_rec`'s bias is zero), so it is added exactly
+    /// once. `W_in * input + bias` comes from the shared layer's `.dot()`; the recurrent
+    /// `W_rec * state` term is accumulated in place to avoid an extra allocation (and the
+    /// no-op zero-bias add) in the RK4 hot path.
+    fn pre_activation(&self, state: &[f64], input: &[f64]) -> ndarray::Array1<f64> {
+        let mut pre = self.w_in.forward_arr(ArrayView1::from(input));
+        pre += &self.w_rec.weights.dot(&ArrayView1::from(state));
+        pre
     }
 
     /// Computes the derivative dx/dt for the LTC dynamics.
@@ -328,12 +300,8 @@ impl<'a> OdeSystem for LtcOdeSystem<'a> {
 pub struct LtcNetwork {
     /// The LTC cell
     pub cell: LtcCell,
-    /// Output projection weights [units x output_dim]
-    pub w_out: Vec<Vec<f64>>,
-    /// Output bias [output_dim]
-    pub b_out: Vec<f64>,
-    /// Output dimension
-    output_dim: usize,
+    /// Output projection (`units -> output_dim`), replacing the former `w_out`/`b_out` fields.
+    output_layer: DenseLayer,
 }
 
 impl LtcNetwork {
@@ -350,41 +318,18 @@ impl LtcNetwork {
     pub fn with_config(input_dim: usize, output_dim: usize, config: LtcConfig) -> Self {
         let mut rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
+            None => StdRng::from_os_rng(),
         };
         let hidden_units = config.units;
         let cell = LtcCell::with_rng(input_dim, config, &mut rng);
+        let output_layer = DenseLayer::new(hidden_units, output_dim, &mut rng);
 
-        let out_scale = (2.0 / (hidden_units + output_dim) as f64).sqrt();
-        let w_out: Vec<Vec<f64>> = (0..hidden_units)
-            .map(|_| {
-                (0..output_dim)
-                    .map(|_| rng.gen_range(-out_scale..out_scale))
-                    .collect()
-            })
-            .collect();
-
-        let b_out = vec![0.0; output_dim];
-
-        LtcNetwork {
-            cell,
-            w_out,
-            b_out,
-            output_dim,
-        }
+        LtcNetwork { cell, output_layer }
     }
 
     /// Projects hidden state to output.
     fn project_output(&self, hidden: &[f64]) -> Vec<f64> {
-        let mut output = self.b_out.clone();
-        for (i, &h) in hidden.iter().enumerate() {
-            if i < self.w_out.len() {
-                for (o, &w) in output.iter_mut().zip(self.w_out[i].iter()) {
-                    *o += w * h;
-                }
-            }
-        }
-        output
+        self.output_layer.forward(hidden)
     }
 
     /// Processes a single input and returns output.
@@ -410,7 +355,7 @@ impl LtcNetwork {
 
     /// Returns the output dimension.
     pub fn output_dim(&self) -> usize {
-        self.output_dim
+        self.output_layer.output_dim()
     }
 
     /// Returns the hidden dimension.
@@ -539,10 +484,10 @@ mod tests {
 
         assert_eq!(cell.units(), 16);
         assert_eq!(cell.input_dim(), 4);
-        assert_eq!(cell.w_in.len(), 4);
-        assert_eq!(cell.w_in[0].len(), 16);
-        assert_eq!(cell.w_rec.len(), 16);
-        assert_eq!(cell.w_rec[0].len(), 16);
+        assert_eq!(cell.w_in.input_dim(), 4);
+        assert_eq!(cell.w_in.output_dim(), 16);
+        assert_eq!(cell.w_rec.input_dim(), 16);
+        assert_eq!(cell.w_rec.output_dim(), 16);
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! - LTC (Liquid Time-Constant with ODE integration)
 //! - CfC (Closed-form Continuous - analytical solution)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use liquid_neural_network::prelude::*;
+use std::hint::black_box;
 
 /// Generates a sine wave sequence for benchmarking.
 fn generate_sine_sequence(length: usize) -> Vec<Vec<f64>> {
