@@ -366,6 +366,53 @@ cargo bench "ODE Solvers"
 cargo bench "Scaling"
 ```
 
+## Predictive Performance on Realistic Data
+
+Next-step prediction accuracy (test MSE, lower is better) for the trainable models against
+a persistence baseline (predict `x[t+1] = x[t]` -- the bar any forecaster must beat), on
+two canonical chaotic benchmarks and one real-world dataset:
+
+| Task | Persistence | TrainableRnn | TrainableCfc | CfC vs baselines |
+|------|-------------|--------------|--------------|------------------|
+| Mackey-Glass (tau=17, chaotic) | 0.00433 | 0.00066 | **0.00015** | 29x better than persistence, 4.4x better than RNN |
+| Lorenz attractor (x,y,z -> next x) | 0.01088 | 0.00014 | **0.00003** | 375x better than persistence, 4.7x better than RNN |
+| Monthly sunspots (SILSO, real) | 0.01396 | 0.01200 | 0.01227 | ~12% better than persistence, on par with RNN |
+
+### Methodology
+
+- **Data.** Mackey-Glass: 1,500 points from the standard discrete form
+  `x[t+1] = x[t] + 0.2*x[t-17]/(1 + x[t-17]^10) - 0.1*x[t]` (200-step warmup discarded).
+  Lorenz: 1,500 samples of the attractor (sigma=10, rho=28, beta=8/3; RK4 at dt=0.01,
+  sampled every 5 steps, 200-sample warmup discarded); inputs are all three channels,
+  target is the next x. Sunspots: 3,330 months of real observations, 1749-2026, from
+  [SILSO](https://www.sidc.be/SILSO/datafiles) (`SN_m_tot_V2.0.csv`, missing values dropped).
+- **Protocol.** Chronological 70/30 train/test split. Min-max scaling to [-0.9, 0.9]
+  fitted on the training region only (no test leakage). Training on overlapping windows
+  (length 64, stride 32) with full BPTT within each window; 40 epochs; Adam at lr 0.005
+  for the CfC, SGD+momentum 0.9 at lr 0.01 for the RNN; 32 hidden units for both;
+  CfC backbone 1x32, seed 42. Test MSE is measured on the held-out region only, with the
+  model's recurrent state warmed by running the full series through `predict`.
+- **Seed sensitivity.** CfC on Mackey-Glass across seeds 42/7/1234: test MSE
+  0.00015/0.00004/0.00003 -- a ~5x spread whose *worst* case is still 29x better than
+  persistence.
+- **Free-run forecasting** (predictions fed back as inputs, Mackey-Glass): RMSE 0.008 at
+  horizon 1, 0.11 at horizon 5, 0.46 at horizon 10 (series std 0.52 in scaled units);
+  diverges beyond ~10 steps. Expected for a next-step-trained model on a chaotic series;
+  multi-step training objectives are future work.
+- **Training cost.** 40 epochs over a 1,500-point series: ~0.5 s for the CfC, ~0.13 s for
+  the RNN (Apple Silicon, release build). The ~4x gap reflects the CfC's larger
+  parameterization (backbone plus four heads vs. two matrices).
+
+### Honest caveats
+
+- On the chaotic benchmarks the CfC's continuous-time inductive bias earns a consistent
+  ~4.5x accuracy advantage over a same-size vanilla RNN. This is the setting the
+  architecture was designed for.
+- On noisy real-world data (sunspots) both models sit near the persistence floor, and
+  more epochs slightly *overfit* (CfC 0.0123 -> 0.0130 at 2x epochs). Monthly sunspot
+  next-step prediction is famously persistence-dominated; beating it requires richer
+  input features (lag windows, cycle-phase encodings), not a different core model.
+
 ## Testing
 
 The suite has 199 unit and integration tests plus doctests:
